@@ -1,0 +1,13 @@
+[package]
+name = "mini-ray-object-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mini-ray-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde.workspace = true

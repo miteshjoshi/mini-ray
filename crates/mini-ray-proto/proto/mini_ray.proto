@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package miniray.v1;
+
+service Head {
+  rpc PutObject(PutObjectRequest) returns (PutObjectResponse);
+  rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
+  rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
+  rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message PutObjectRequest {
+  string object_id = 1;
+  bytes data = 2;
+}
+
+message PutObjectResponse {
+  string object_id = 1;
+}
+
+message GetObjectRequest {
+  string object_id = 1;
+}
+
+message GetObjectResponse {
+  string object_id = 1;
+  bytes data = 2;
+}
+
+message SubmitTaskRequest {
+  string function_id = 1;
+  repeated string dependencies = 2;
+  string output_id = 3;
+  uint32 max_retries = 4;
+}
+
+message SubmitTaskResponse {
+  string task_id = 1;
+  string output_id = 2;
+}
+
+message TaskLease {
+  string task_id = 1;
+  string function_id = 2;
+  repeated string dependencies = 3;
+  string output_id = 4;
+  uint32 attempt = 5;
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  uint32 slots = 2;
+}
+
+message RegisterWorkerResponse {
+  string worker_id = 1;
+}
+
+message PollTaskRequest {
+  string worker_id = 1;
+  uint32 capacity = 2;
+}
+
+message PollTaskResponse {
+  repeated TaskLease tasks = 1;
+}
+
+message CompleteTaskRequest {
+  string worker_id = 1;
+  string task_id = 2;
+  string output_id = 3;
+  bytes data = 4;
+}
+
+message CompleteTaskResponse {}
+
+message FailTaskRequest {
+  string worker_id = 1;
+  string task_id = 2;
+  string error = 3;
+}
+
+message FailTaskResponse {}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  uint32 running = 2;
+  uint32 queued = 3;
+}
+
+message HeartbeatResponse {}
