@@ -65,6 +65,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_bytes_and_get_bytes_round_trip() {
+        let store = InMemoryObjectStore::new();
+        let id = ObjectId::new();
+
+        let stored_id = store.put_bytes(id, vec![1, 2, 3, 4]).await;
+        let bytes = store.get_bytes(id).await.unwrap();
+
+        assert_eq!(stored_id, id);
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn contains_tracks_object_presence() {
+        let store = InMemoryObjectStore::new();
+        let id = ObjectId::new();
+
+        assert!(!store.contains(id).await);
+
+        store.put_bytes(id, vec![9]).await;
+
+        assert!(store.contains(id).await);
+    }
+
+    #[tokio::test]
+    async fn cloned_store_handles_share_the_same_objects() {
+        let store = InMemoryObjectStore::new();
+        let clone = store.clone();
+
+        let object_ref = store.put("hello".to_string()).await.unwrap();
+        let value: String = clone.get(object_ref).await.unwrap();
+
+        assert_eq!(value, "hello");
+    }
+
+    #[tokio::test]
     async fn missing_object_returns_error() {
         let store = InMemoryObjectStore::new();
         let err = store.get_bytes(ObjectId::new()).await.unwrap_err();
