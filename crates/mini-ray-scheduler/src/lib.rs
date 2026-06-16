@@ -63,6 +63,13 @@ impl Scheduler {
     }
 
     pub fn submit(&mut self, spec: TaskSpec) -> Result<()> {
+        if self.tasks.contains_key(&spec.task_id) {
+            return Err(MiniRayError::Scheduler(format!(
+                "task {} already exists",
+                spec.task_id
+            )));
+        }
+
         let state = if self.dependencies_ready(&spec) {
             self.ready.push_back(spec.task_id);
             TaskState::Ready
@@ -102,12 +109,19 @@ impl Scheduler {
             .workers
             .get(&worker_id)
             .ok_or_else(|| MiniRayError::Scheduler(format!("unknown worker {worker_id}")))?;
-        let available = worker.slots.saturating_sub(worker.leased.len()).min(capacity);
+        let available = worker
+            .slots
+            .saturating_sub(worker.leased.len())
+            .min(capacity);
         let to_assign = available.max(steal_capacity(capacity, worker.leased.len()));
 
         let mut assigned = Vec::new();
         for _ in 0..to_assign {
-            let Some(task_id) = self.ready.pop_front().or_else(|| self.steal_from_busiest(worker_id)) else {
+            let Some(task_id) = self
+                .ready
+                .pop_front()
+                .or_else(|| self.steal_from_busiest(worker_id))
+            else {
                 break;
             };
             if let Some(record) = self.tasks.get_mut(&task_id) {
@@ -127,22 +141,32 @@ impl Scheduler {
             .tasks
             .get_mut(&task_id)
             .ok_or_else(|| MiniRayError::Scheduler(format!("unknown task {task_id}")))?;
+        if record.state != TaskState::Leased(worker_id) {
+            return Err(MiniRayError::Scheduler(format!(
+                "task {task_id} is not leased to worker {worker_id}"
+            )));
+        }
         record.state = TaskState::Running(worker_id);
         Ok(())
     }
 
-    pub fn complete(&mut self, worker_id: WorkerId, task_id: TaskId, output_id: ObjectId) -> Result<()> {
+    pub fn complete(
+        &mut self,
+        worker_id: WorkerId,
+        task_id: TaskId,
+        output_id: ObjectId,
+    ) -> Result<()> {
+        self.ensure_owned_by_worker(worker_id, task_id)?;
         self.remove_worker_lease(worker_id, task_id);
-        let record = self
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| MiniRayError::Scheduler(format!("unknown task {task_id}")))?;
-        record.state = TaskState::Finished;
+        if let Some(record) = self.tasks.get_mut(&task_id) {
+            record.state = TaskState::Finished;
+        }
         self.object_available(output_id);
         Ok(())
     }
 
     pub fn fail(&mut self, worker_id: WorkerId, task_id: TaskId, error: String) -> Result<()> {
+        self.ensure_owned_by_worker(worker_id, task_id)?;
         self.remove_worker_lease(worker_id, task_id);
         let record = self
             .tasks
@@ -192,7 +216,8 @@ impl Scheduler {
                                 record.state = TaskState::Ready;
                                 self.ready.push_back(task_id);
                             } else {
-                                record.state = TaskState::Failed("worker heartbeat expired".to_string());
+                                record.state =
+                                    TaskState::Failed("worker heartbeat expired".to_string());
                             }
                         }
                     }
@@ -233,6 +258,20 @@ impl Scheduler {
             worker.leased.retain(|leased| *leased != task_id);
         }
     }
+
+    fn ensure_owned_by_worker(&self, worker_id: WorkerId, task_id: TaskId) -> Result<()> {
+        let record = self
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| MiniRayError::Scheduler(format!("unknown task {task_id}")))?;
+
+        match record.state {
+            TaskState::Leased(owner) | TaskState::Running(owner) if owner == worker_id => Ok(()),
+            _ => Err(MiniRayError::Scheduler(format!(
+                "task {task_id} is not owned by worker {worker_id}"
+            ))),
+        }
+    }
 }
 
 impl Default for Scheduler {
@@ -269,6 +308,17 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_task_submission_is_rejected() {
+        let spec = TaskSpec::new("noop", vec![], ObjectId::new());
+        let mut scheduler = Scheduler::default();
+
+        scheduler.submit(spec.clone()).unwrap();
+        let err = scheduler.submit(spec).unwrap_err();
+
+        assert!(matches!(err, MiniRayError::Scheduler(_)));
+    }
+
+    #[test]
     fn multiple_workers_get_independent_tasks() {
         let mut scheduler = Scheduler::default();
         let worker_a = WorkerId::new();
@@ -277,11 +327,60 @@ mod tests {
         scheduler.register_worker(worker_b, 1);
 
         for _ in 0..2 {
-            scheduler.submit(TaskSpec::new("noop", vec![], ObjectId::new())).unwrap();
+            scheduler
+                .submit(TaskSpec::new("noop", vec![], ObjectId::new()))
+                .unwrap();
         }
 
         assert_eq!(scheduler.lease_tasks(worker_a, 1).unwrap().len(), 1);
         assert_eq!(scheduler.lease_tasks(worker_b, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn leasing_marks_task_as_leased_to_worker() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        let spec = TaskSpec::new("noop", vec![], ObjectId::new());
+        let task_id = spec.task_id;
+        scheduler.submit(spec).unwrap();
+
+        let leased = scheduler.lease_tasks(worker, 1).unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(
+            scheduler.task_state(task_id),
+            Some(TaskState::Leased(worker))
+        );
+    }
+
+    #[test]
+    fn unknown_worker_cannot_lease_tasks() {
+        let mut scheduler = Scheduler::default();
+        let err = scheduler.lease_tasks(WorkerId::new(), 1).unwrap_err();
+
+        assert!(matches!(err, MiniRayError::Scheduler(_)));
+    }
+
+    #[test]
+    fn wrong_worker_cannot_mark_task_running() {
+        let mut scheduler = Scheduler::default();
+        let owner = WorkerId::new();
+        let other = WorkerId::new();
+        scheduler.register_worker(owner, 1);
+        scheduler.register_worker(other, 1);
+        scheduler
+            .submit(TaskSpec::new("noop", vec![], ObjectId::new()))
+            .unwrap();
+        let task_id = scheduler.lease_tasks(owner, 1).unwrap()[0].task_id;
+
+        let err = scheduler.mark_running(other, task_id).unwrap_err();
+
+        assert!(matches!(err, MiniRayError::Scheduler(_)));
+        assert_eq!(
+            scheduler.task_state(task_id),
+            Some(TaskState::Leased(owner))
+        );
     }
 
     #[test]
@@ -293,7 +392,9 @@ mod tests {
         scheduler.register_worker(idle, 1);
 
         for _ in 0..3 {
-            scheduler.submit(TaskSpec::new("noop", vec![], ObjectId::new())).unwrap();
+            scheduler
+                .submit(TaskSpec::new("noop", vec![], ObjectId::new()))
+                .unwrap();
         }
         let leased = scheduler.lease_tasks(busy, 3).unwrap();
         scheduler.mark_running(busy, leased[0].task_id).unwrap();
@@ -301,7 +402,53 @@ mod tests {
         let stolen = scheduler.lease_tasks(idle, 1).unwrap();
         assert_eq!(stolen.len(), 1);
         assert_ne!(stolen[0].task_id, leased[0].task_id);
-        assert_eq!(scheduler.task_state(leased[0].task_id), Some(TaskState::Running(busy)));
+        assert_eq!(
+            scheduler.task_state(leased[0].task_id),
+            Some(TaskState::Running(busy))
+        );
+    }
+
+    #[test]
+    fn failed_task_retries_once_then_fails() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        let spec = TaskSpec::new("noop", vec![], ObjectId::new());
+        let task_id = spec.task_id;
+        scheduler.submit(spec).unwrap();
+
+        scheduler.lease_tasks(worker, 1).unwrap();
+        scheduler.fail(worker, task_id, "boom".to_string()).unwrap();
+        assert_eq!(scheduler.task_state(task_id), Some(TaskState::Ready));
+
+        scheduler.lease_tasks(worker, 1).unwrap();
+        scheduler
+            .fail(worker, task_id, "boom again".to_string())
+            .unwrap();
+        assert_eq!(
+            scheduler.task_state(task_id),
+            Some(TaskState::Failed("boom again".to_string()))
+        );
+    }
+
+    #[test]
+    fn complete_makes_output_available_for_dependent_task() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        let output = ObjectId::new();
+        let producer = TaskSpec::new("produce", vec![], output);
+        let producer_id = producer.task_id;
+        let consumer = TaskSpec::new("consume", vec![output], ObjectId::new());
+        let consumer_id = consumer.task_id;
+        scheduler.submit(producer).unwrap();
+        scheduler.submit(consumer).unwrap();
+
+        scheduler.lease_tasks(worker, 1).unwrap();
+        scheduler.complete(worker, producer_id, output).unwrap();
+
+        assert_eq!(scheduler.task_state(producer_id), Some(TaskState::Finished));
+        assert_eq!(scheduler.task_state(consumer_id), Some(TaskState::Ready));
     }
 
     #[test]
