@@ -40,7 +40,7 @@ impl InMemoryObjectStore {
 
     pub async fn get<T>(&self, object_ref: ObjectRef<T>) -> Result<T>
     where
-        T: DeserializeOwned,
+        T: DeserializeOwned + 'static,
     {
         let bytes = self.get_bytes(object_ref.id()).await?;
         decode(&bytes)

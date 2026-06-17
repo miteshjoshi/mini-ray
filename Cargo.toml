@@ -28,7 +28,7 @@ tonic = "0.12"
 tonic-build = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1.8", features = ["v4", "serde"] }
+uuid = { version = "=1.8.0", features = ["v4", "serde"] }
 
 [workspace.dependencies.mini-ray-core]
 path = "crates/mini-ray-core"
