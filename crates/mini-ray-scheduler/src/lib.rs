@@ -165,6 +165,10 @@ impl Scheduler {
         Ok(())
     }
 
+    pub fn validate_task_owner(&self, worker_id: WorkerId, task_id: TaskId) -> Result<()> {
+        self.ensure_owned_by_worker(worker_id, task_id)
+    }
+
     pub fn fail(&mut self, worker_id: WorkerId, task_id: TaskId, error: String) -> Result<()> {
         self.ensure_owned_by_worker(worker_id, task_id)?;
         self.remove_worker_lease(worker_id, task_id);

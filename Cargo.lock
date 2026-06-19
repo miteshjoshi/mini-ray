@@ -469,6 +469,8 @@ dependencies = [
  "mini-ray-object-store",
  "mini-ray-proto",
  "mini-ray-scheduler",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

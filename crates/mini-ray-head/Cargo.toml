@@ -10,3 +10,5 @@ mini-ray-core.workspace = true
 mini-ray-object-store.workspace = true
 mini-ray-proto.workspace = true
 mini-ray-scheduler.workspace = true
+tokio.workspace = true
+tonic.workspace = true
