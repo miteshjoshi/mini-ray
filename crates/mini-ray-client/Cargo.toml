@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 mini-ray-core.workspace = true
 mini-ray-proto.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tonic.workspace = true

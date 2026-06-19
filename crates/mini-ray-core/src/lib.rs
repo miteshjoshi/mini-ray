@@ -156,7 +156,11 @@ pub struct TaskSpec {
 }
 
 impl TaskSpec {
-    pub fn new(function_id: impl Into<String>, dependencies: Vec<ObjectId>, output_id: ObjectId) -> Self {
+    pub fn new(
+        function_id: impl Into<String>,
+        dependencies: Vec<ObjectId>,
+        output_id: ObjectId,
+    ) -> Self {
         Self {
             task_id: TaskId::new(),
             function_id: function_id.into(),
