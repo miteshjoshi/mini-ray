@@ -1,8 +1,11 @@
 //! User-facing Rust client API.
 
-use mini_ray_core::{decode, encode, MiniRayError, ObjectId, ObjectRef, Result, TaskId};
+use mini_ray_core::{
+    decode, encode, ActorId, ActorRef, MiniRayError, ObjectId, ObjectRef, Result, TaskId,
+};
 use mini_ray_proto::miniray::v1::{
-    head_client::HeadClient, GetObjectRequest, PutObjectRequest, SubmitTaskRequest,
+    head_client::HeadClient, CreateActorRequest, GetObjectRequest, PutObjectRequest,
+    SubmitActorTaskRequest, SubmitTaskRequest,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
@@ -116,6 +119,105 @@ impl Client {
             .into_inner();
 
         // Parse both IDs so malformed head responses fail at the API boundary.
+        let _task_id = TaskId::from_string(&response.task_id)?;
+        let output_id = ObjectId::from_string(&response.output_id)?;
+        Ok(ObjectRef::new(output_id))
+    }
+
+    pub async fn create_actor<Actor, Arg>(
+        &self,
+        actor_type: impl Into<String>,
+        constructor_dependencies: Vec<ObjectRef<Arg>>,
+    ) -> Result<ActorRef<Actor>>
+    where
+        Actor: 'static,
+        Arg: 'static,
+    {
+        let constructor_dependencies = constructor_dependencies
+            .into_iter()
+            .map(|object_ref| object_ref.erase())
+            .collect();
+
+        self.create_actor_refs(actor_type, constructor_dependencies)
+            .await
+    }
+
+    pub async fn create_actor_refs<Actor>(
+        &self,
+        actor_type: impl Into<String>,
+        constructor_dependencies: Vec<ObjectRef<()>>,
+    ) -> Result<ActorRef<Actor>>
+    where
+        Actor: 'static,
+    {
+        let actor_id = ActorId::new();
+        let request = CreateActorRequest {
+            actor_type: actor_type.into(),
+            constructor_dependencies: object_ref_ids(constructor_dependencies),
+            actor_id: actor_id.to_string(),
+            max_restarts: 0,
+        };
+
+        let response = self
+            .inner
+            .lock()
+            .await
+            .create_actor(request)
+            .await
+            .map_err(status_error)?
+            .into_inner();
+
+        let actor_id = ActorId::from_string(&response.actor_id)?;
+        Ok(ActorRef::new(actor_id))
+    }
+
+    pub async fn call_actor<Actor, Arg, Out>(
+        &self,
+        actor_ref: ActorRef<Actor>,
+        method_id: impl Into<String>,
+        dependencies: Vec<ObjectRef<Arg>>,
+    ) -> Result<ObjectRef<Out>>
+    where
+        Actor: 'static,
+        Arg: 'static,
+        Out: 'static,
+    {
+        let dependencies = dependencies
+            .into_iter()
+            .map(|object_ref| object_ref.erase())
+            .collect();
+
+        self.call_actor_refs(actor_ref.erase(), method_id, dependencies)
+            .await
+    }
+
+    pub async fn call_actor_refs<Out>(
+        &self,
+        actor_ref: ActorRef<()>,
+        method_id: impl Into<String>,
+        dependencies: Vec<ObjectRef<()>>,
+    ) -> Result<ObjectRef<Out>>
+    where
+        Out: 'static,
+    {
+        let output_id = ObjectId::new();
+        let request = SubmitActorTaskRequest {
+            actor_id: actor_ref.id().to_string(),
+            method_id: method_id.into(),
+            dependencies: object_ref_ids(dependencies),
+            output_id: output_id.to_string(),
+            max_retries: 1,
+        };
+
+        let response = self
+            .inner
+            .lock()
+            .await
+            .submit_actor_task(request)
+            .await
+            .map_err(status_error)?
+            .into_inner();
+
         let _task_id = TaskId::from_string(&response.task_id)?;
         let output_id = ObjectId::from_string(&response.output_id)?;
         Ok(ObjectRef::new(output_id))

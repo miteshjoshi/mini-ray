@@ -6,6 +6,8 @@ service Head {
   rpc PutObject(PutObjectRequest) returns (PutObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  rpc CreateActor(CreateActorRequest) returns (CreateActorResponse);
+  rpc SubmitActorTask(SubmitActorTaskRequest) returns (SubmitActorTaskResponse);
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
   rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
@@ -39,6 +41,30 @@ message SubmitTaskRequest {
 }
 
 message SubmitTaskResponse {
+  string task_id = 1;
+  string output_id = 2;
+}
+
+message CreateActorRequest {
+  string actor_type = 1;
+  repeated string constructor_dependencies = 2;
+  string actor_id = 3;
+  uint32 max_restarts = 4;
+}
+
+message CreateActorResponse {
+  string actor_id = 1;
+}
+
+message SubmitActorTaskRequest {
+  string actor_id = 1;
+  string method_id = 2;
+  repeated string dependencies = 3;
+  string output_id = 4;
+  uint32 max_retries = 5;
+}
+
+message SubmitActorTaskResponse {
   string task_id = 1;
   string output_id = 2;
 }
