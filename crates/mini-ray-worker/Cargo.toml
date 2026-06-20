@@ -6,5 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+clap.workspace = true
 mini-ray-core.workspace = true
+mini-ray-proto.workspace = true
 mini-ray-runtime.workspace = true
+tokio.workspace = true
+tonic.workspace = true
