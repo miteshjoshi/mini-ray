@@ -567,6 +567,7 @@ dependencies = [
 name = "mini-ray-head"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "mini-ray-core",
  "mini-ray-object-store",
  "mini-ray-proto",

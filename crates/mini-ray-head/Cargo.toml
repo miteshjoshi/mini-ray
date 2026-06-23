@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+clap.workspace = true
 mini-ray-core.workspace = true
 mini-ray-object-store.workspace = true
 mini-ray-proto.workspace = true

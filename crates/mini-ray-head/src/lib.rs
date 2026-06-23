@@ -3,16 +3,19 @@
 use mini_ray_core::{ActorId, ActorSpec, MiniRayError, ObjectId, TaskId, TaskSpec, WorkerId};
 use mini_ray_object_store::InMemoryObjectStore;
 use mini_ray_proto::miniray::v1::{
-    head_server::Head, CompleteTaskRequest, CompleteTaskResponse, CreateActorRequest,
-    CreateActorResponse, FailTaskRequest, FailTaskResponse, GetObjectRequest, GetObjectResponse,
-    HeartbeatRequest, HeartbeatResponse, PollTaskRequest, PollTaskResponse, PutObjectRequest,
-    PutObjectResponse, RegisterWorkerRequest, RegisterWorkerResponse, SubmitActorTaskRequest,
-    SubmitActorTaskResponse, SubmitTaskRequest, SubmitTaskResponse, TaskLease,
+    head_server::{Head, HeadServer},
+    CompleteTaskRequest, CompleteTaskResponse, CreateActorRequest, CreateActorResponse,
+    FailTaskRequest, FailTaskResponse, GetObjectRequest, GetObjectResponse, HeartbeatRequest,
+    HeartbeatResponse, PollTaskRequest, PollTaskResponse, PutObjectRequest, PutObjectResponse,
+    RegisterWorkerRequest, RegisterWorkerResponse, SubmitActorTaskRequest, SubmitActorTaskResponse,
+    SubmitTaskRequest, SubmitTaskResponse, TaskLease,
 };
 use mini_ray_scheduler::Scheduler;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 #[derive(Debug, Clone)]
@@ -42,6 +45,13 @@ impl HeadService {
     pub async fn actor_count(&self) -> usize {
         self.actors.lock().await.len()
     }
+}
+
+pub async fn serve(bind: SocketAddr) -> Result<(), tonic::transport::Error> {
+    Server::builder()
+        .add_service(HeadServer::new(HeadService::with_defaults()))
+        .serve(bind)
+        .await
 }
 
 #[tonic::async_trait]
