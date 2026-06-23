@@ -2,10 +2,15 @@
 
 use mini_ray_core::{decode, encode, MiniRayError, Result};
 use serde::{de::DeserializeOwned, Serialize};
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 type RawTaskHandler = Arc<dyn Fn(Vec<Vec<u8>>) -> Result<Vec<u8>> + Send + Sync + 'static>;
+type RawActorConstructor =
+    Arc<dyn Fn(Vec<Vec<u8>>) -> Result<Box<dyn Any + Send>> + Send + Sync + 'static>;
+type RawActorMethod =
+    Arc<dyn Fn(&mut dyn Any, Vec<Vec<u8>>) -> Result<Vec<u8>> + Send + Sync + 'static>;
 
 #[derive(Clone, Default)]
 pub struct TaskRegistry {
@@ -124,9 +129,216 @@ fn expect_arg_count(args: &[Vec<u8>], expected: usize) -> Result<()> {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct ActorRegistry {
+    constructors: HashMap<String, RawActorConstructor>,
+    methods: HashMap<(String, String), RawActorMethod>,
+}
+
+impl std::fmt::Debug for ActorRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorRegistry")
+            .field(
+                "constructors",
+                &self.constructors.keys().collect::<Vec<_>>(),
+            )
+            .field("methods", &self.methods.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl ActorRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_constructor_raw<F>(
+        &mut self,
+        actor_type: impl Into<String>,
+        constructor: F,
+    ) -> Result<()>
+    where
+        F: Fn(Vec<Vec<u8>>) -> Result<Box<dyn Any + Send>> + Send + Sync + 'static,
+    {
+        let actor_type = actor_type.into();
+        if self.constructors.contains_key(&actor_type) {
+            return Err(MiniRayError::TaskFailed(format!(
+                "actor constructor {actor_type} is already registered"
+            )));
+        }
+
+        self.constructors.insert(actor_type, Arc::new(constructor));
+        Ok(())
+    }
+
+    pub fn register_constructor_nullary<F, Actor>(
+        &mut self,
+        actor_type: impl Into<String>,
+        constructor: F,
+    ) -> Result<()>
+    where
+        F: Fn() -> Actor + Send + Sync + 'static,
+        Actor: Any + Send + 'static,
+    {
+        self.register_constructor_raw(actor_type, move |args| {
+            expect_arg_count(&args, 0)?;
+            Ok(Box::new(constructor()))
+        })
+    }
+
+    pub fn register_constructor_unary<F, Arg, Actor>(
+        &mut self,
+        actor_type: impl Into<String>,
+        constructor: F,
+    ) -> Result<()>
+    where
+        F: Fn(Arg) -> Actor + Send + Sync + 'static,
+        Arg: DeserializeOwned,
+        Actor: Any + Send + 'static,
+    {
+        self.register_constructor_raw(actor_type, move |args| {
+            expect_arg_count(&args, 1)?;
+            let arg = decode(&args[0])?;
+            Ok(Box::new(constructor(arg)))
+        })
+    }
+
+    pub fn register_method_raw<F>(
+        &mut self,
+        actor_type: impl Into<String>,
+        method_id: impl Into<String>,
+        method: F,
+    ) -> Result<()>
+    where
+        F: Fn(&mut dyn Any, Vec<Vec<u8>>) -> Result<Vec<u8>> + Send + Sync + 'static,
+    {
+        let key = (actor_type.into(), method_id.into());
+        if self.methods.contains_key(&key) {
+            return Err(MiniRayError::TaskFailed(format!(
+                "actor method {}.{} is already registered",
+                key.0, key.1
+            )));
+        }
+
+        self.methods.insert(key, Arc::new(method));
+        Ok(())
+    }
+
+    pub fn register_method_unary<F, Actor, Arg, Out>(
+        &mut self,
+        actor_type: impl Into<String>,
+        method_id: impl Into<String>,
+        method: F,
+    ) -> Result<()>
+    where
+        F: Fn(&mut Actor, Arg) -> Out + Send + Sync + 'static,
+        Actor: Any + Send + 'static,
+        Arg: DeserializeOwned,
+        Out: Serialize,
+    {
+        let actor_type = actor_type.into();
+        self.register_method_raw(actor_type.clone(), method_id, move |actor, args| {
+            expect_arg_count(&args, 1)?;
+            let actor = actor.downcast_mut::<Actor>().ok_or_else(|| {
+                MiniRayError::TaskFailed(format!("actor state type mismatch for {actor_type}"))
+            })?;
+            let arg = decode(&args[0])?;
+            encode(&method(actor, arg))
+        })
+    }
+
+    fn construct(&self, actor_type: &str, args: Vec<Vec<u8>>) -> Result<Box<dyn Any + Send>> {
+        let constructor = self.constructors.get(actor_type).ok_or_else(|| {
+            MiniRayError::TaskFailed(format!("unknown actor constructor {actor_type}"))
+        })?;
+        constructor(args)
+    }
+
+    fn execute_method(
+        &self,
+        actor_type: &str,
+        method_id: &str,
+        actor: &mut dyn Any,
+        args: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let method = self
+            .methods
+            .get(&(actor_type.to_string(), method_id.to_string()))
+            .ok_or_else(|| {
+                MiniRayError::TaskFailed(format!("unknown actor method {actor_type}.{method_id}"))
+            })?;
+        method(actor, args)
+    }
+}
+
+#[derive(Default)]
+pub struct ActorInstanceStore {
+    actors: HashMap<String, ActorInstance>,
+}
+
+struct ActorInstance {
+    actor_type: String,
+    state: Box<dyn Any + Send>,
+}
+
+impl std::fmt::Debug for ActorInstanceStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorInstanceStore")
+            .field("actors", &self.actors.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl ActorInstanceStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.actors.len()
+    }
+
+    pub fn execute(
+        &mut self,
+        registry: &ActorRegistry,
+        actor_id: impl Into<String>,
+        actor_type: &str,
+        method_id: &str,
+        constructor_args: Vec<Vec<u8>>,
+        method_args: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let actor_id = actor_id.into();
+        if !self.actors.contains_key(&actor_id) {
+            let state = registry.construct(actor_type, constructor_args)?;
+            self.actors.insert(
+                actor_id.clone(),
+                ActorInstance {
+                    actor_type: actor_type.to_string(),
+                    state,
+                },
+            );
+        }
+
+        let instance = self.actors.get_mut(&actor_id).expect("actor was inserted");
+        if instance.actor_type != actor_type {
+            return Err(MiniRayError::TaskFailed(format!(
+                "actor {actor_id} is {}, not {actor_type}",
+                instance.actor_type
+            )));
+        }
+
+        registry.execute_method(actor_type, method_id, instance.state.as_mut(), method_args)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct Counter {
+        value: u64,
+    }
 
     #[test]
     fn register_and_execute_unary_handler() {
@@ -210,5 +422,64 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, MiniRayError::Decode(_)));
+    }
+
+    #[test]
+    fn actor_instance_preserves_state_across_method_calls() {
+        let mut registry = ActorRegistry::new();
+        registry
+            .register_constructor_unary("Counter", |initial: u64| Counter { value: initial })
+            .unwrap();
+        registry
+            .register_method_unary(
+                "Counter",
+                "increment",
+                |counter: &mut Counter, delta: u64| {
+                    counter.value += delta;
+                    counter.value
+                },
+            )
+            .unwrap();
+        let mut instances = ActorInstanceStore::new();
+
+        let first = instances
+            .execute(
+                &registry,
+                "actor-1",
+                "Counter",
+                "increment",
+                vec![encode(&10u64).unwrap()],
+                vec![encode(&2u64).unwrap()],
+            )
+            .unwrap();
+        let second = instances
+            .execute(
+                &registry,
+                "actor-1",
+                "Counter",
+                "increment",
+                vec![],
+                vec![encode(&5u64).unwrap()],
+            )
+            .unwrap();
+
+        assert_eq!(decode::<u64>(&first).unwrap(), 12);
+        assert_eq!(decode::<u64>(&second).unwrap(), 17);
+        assert_eq!(instances.len(), 1);
+    }
+
+    #[test]
+    fn unknown_actor_method_returns_error() {
+        let mut registry = ActorRegistry::new();
+        registry
+            .register_constructor_nullary("Counter", || Counter { value: 0 })
+            .unwrap();
+        let mut instances = ActorInstanceStore::new();
+
+        let err = instances
+            .execute(&registry, "actor-1", "Counter", "missing", vec![], vec![])
+            .unwrap_err();
+
+        assert!(matches!(err, MiniRayError::TaskFailed(_)));
     }
 }

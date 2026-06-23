@@ -75,6 +75,10 @@ message TaskLease {
   repeated string dependencies = 3;
   string output_id = 4;
   uint32 attempt = 5;
+  string actor_id = 6;
+  string actor_type = 7;
+  string method_id = 8;
+  repeated string constructor_dependencies = 9;
 }
 
 message RegisterWorkerRequest {

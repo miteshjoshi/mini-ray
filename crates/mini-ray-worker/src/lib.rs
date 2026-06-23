@@ -221,6 +221,10 @@ mod tests {
                 .collect(),
             output_id: output_id.to_string(),
             attempt: 0,
+            actor_id: String::new(),
+            actor_type: String::new(),
+            method_id: String::new(),
+            constructor_dependencies: Vec::new(),
         }
     }
 

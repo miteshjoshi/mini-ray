@@ -286,6 +286,10 @@ fn task_lease_from_spec(spec: TaskSpec) -> TaskLease {
             .collect(),
         output_id: spec.output_id.to_string(),
         attempt: spec.attempt,
+        actor_id: String::new(),
+        actor_type: String::new(),
+        method_id: String::new(),
+        constructor_dependencies: Vec::new(),
     }
 }
 
