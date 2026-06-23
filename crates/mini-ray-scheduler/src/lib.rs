@@ -118,8 +118,7 @@ impl Scheduler {
         let mut assigned = Vec::new();
         for _ in 0..to_assign {
             let Some(task_id) = self
-                .ready
-                .pop_front()
+                .pop_ready_for_worker(worker_id)
                 .or_else(|| self.steal_from_busiest(worker_id))
             else {
                 break;
@@ -244,17 +243,38 @@ impl Scheduler {
             .max_by_key(|(_, worker)| worker.leased.len())
             .map(|(worker_id, _)| *worker_id)?;
 
+        let index = self
+            .workers
+            .get(&victim_id)?
+            .leased
+            .iter()
+            .position(|task_id| {
+                self.tasks.get(task_id).is_some_and(|record| {
+                    matches!(record.state, TaskState::Leased(_)) && self.can_run(record, thief)
+                })
+            })?;
         let victim = self.workers.get_mut(&victim_id)?;
-        let index = victim.leased.iter().position(|task_id| {
-            self.tasks
-                .get(task_id)
-                .is_some_and(|record| matches!(record.state, TaskState::Leased(_)))
-        })?;
         let task_id = victim.leased.remove(index)?;
         if let Some(record) = self.tasks.get_mut(&task_id) {
             record.state = TaskState::Ready;
         }
         Some(task_id)
+    }
+
+    fn pop_ready_for_worker(&mut self, worker_id: WorkerId) -> Option<TaskId> {
+        let index = self.ready.iter().position(|task_id| {
+            self.tasks
+                .get(task_id)
+                .is_some_and(|record| self.can_run(record, worker_id))
+        })?;
+        self.ready.remove(index)
+    }
+
+    fn can_run(&self, record: &TaskRecord, worker_id: WorkerId) -> bool {
+        match record.spec.target_worker {
+            Some(target) => target == worker_id,
+            None => true,
+        }
     }
 
     fn remove_worker_lease(&mut self, worker_id: WorkerId, task_id: TaskId) {
@@ -338,6 +358,44 @@ mod tests {
 
         assert_eq!(scheduler.lease_tasks(worker_a, 1).unwrap().len(), 1);
         assert_eq!(scheduler.lease_tasks(worker_b, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pinned_task_only_leases_to_target_worker() {
+        let mut scheduler = Scheduler::default();
+        let target = WorkerId::new();
+        let other = WorkerId::new();
+        scheduler.register_worker(target, 1);
+        scheduler.register_worker(other, 1);
+        let mut spec = TaskSpec::new("actor_method", vec![], ObjectId::new());
+        spec.target_worker = Some(target);
+        let task_id = spec.task_id;
+        scheduler.submit(spec).unwrap();
+
+        assert!(scheduler.lease_tasks(other, 1).unwrap().is_empty());
+        let leased = scheduler.lease_tasks(target, 1).unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].task_id, task_id);
+    }
+
+    #[test]
+    fn pinned_task_is_not_stolen_by_non_target_worker() {
+        let mut scheduler = Scheduler::default();
+        let target = WorkerId::new();
+        let other = WorkerId::new();
+        scheduler.register_worker(target, 2);
+        scheduler.register_worker(other, 1);
+        let mut pinned = TaskSpec::new("actor_method", vec![], ObjectId::new());
+        pinned.target_worker = Some(target);
+        scheduler.submit(pinned).unwrap();
+        let leased_to_target = scheduler.lease_tasks(target, 1).unwrap();
+
+        assert!(scheduler.lease_tasks(other, 1).unwrap().is_empty());
+        assert_eq!(
+            scheduler.task_state(leased_to_target[0].task_id),
+            Some(TaskState::Leased(target))
+        );
     }
 
     #[test]

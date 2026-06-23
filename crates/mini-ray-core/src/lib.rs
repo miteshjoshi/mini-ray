@@ -220,6 +220,7 @@ pub struct TaskSpec {
     pub function_id: String,
     pub dependencies: Vec<ObjectId>,
     pub output_id: ObjectId,
+    pub target_worker: Option<WorkerId>,
     pub max_retries: u32,
     pub attempt: u32,
 }
@@ -235,6 +236,7 @@ impl TaskSpec {
             function_id: function_id.into(),
             dependencies,
             output_id,
+            target_worker: None,
             max_retries: 1,
             attempt: 0,
         }

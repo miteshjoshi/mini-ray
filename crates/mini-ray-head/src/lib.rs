@@ -22,7 +22,23 @@ use tonic::{Request, Response, Status};
 pub struct HeadService {
     object_store: InMemoryObjectStore,
     scheduler: Arc<Mutex<Scheduler>>,
-    actors: Arc<Mutex<HashMap<ActorId, ActorSpec>>>,
+    actors: Arc<Mutex<HashMap<ActorId, ActorRecord>>>,
+    actor_tasks: Arc<Mutex<HashMap<TaskId, ActorTaskLeaseMeta>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActorRecord {
+    spec: ActorSpec,
+    owner_worker: Option<WorkerId>,
+}
+
+#[derive(Debug, Clone)]
+struct ActorTaskLeaseMeta {
+    actor_id: ActorId,
+    actor_type: String,
+    method_id: String,
+    dependencies: Vec<ObjectId>,
+    constructor_dependencies: Vec<ObjectId>,
 }
 
 impl HeadService {
@@ -31,6 +47,7 @@ impl HeadService {
             object_store,
             scheduler: Arc::new(Mutex::new(scheduler)),
             actors: Arc::new(Mutex::new(HashMap::new())),
+            actor_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -125,7 +142,13 @@ impl Head for HeadService {
             max_restarts: request.max_restarts,
         };
 
-        self.actors.lock().await.insert(actor_id, spec);
+        self.actors.lock().await.insert(
+            actor_id,
+            ActorRecord {
+                spec,
+                owner_worker: None,
+            },
+        );
 
         Ok(Response::new(CreateActorResponse {
             actor_id: actor_id.to_string(),
@@ -138,23 +161,42 @@ impl Head for HeadService {
     ) -> std::result::Result<Response<SubmitActorTaskResponse>, Status> {
         let request = request.into_inner();
         let actor_id = parse_actor_id(&request.actor_id)?;
-        let actor_type = self
+        let actor = self
             .actors
             .lock()
             .await
             .get(&actor_id)
-            .map(|spec| spec.actor_type.clone())
+            .cloned()
             .ok_or_else(|| Status::not_found(format!("actor {actor_id} was not found")))?;
 
         let output_id = parse_object_id(&request.output_id)?;
-        let dependencies = parse_object_ids(request.dependencies)?;
+        let method_dependencies = parse_object_ids(request.dependencies)?;
+        let mut scheduling_dependencies = method_dependencies.clone();
+        if actor.owner_worker.is_none() {
+            scheduling_dependencies.extend(actor.spec.constructor_dependencies.iter().copied());
+        }
         let mut spec = TaskSpec::new(
-            format!("actor:{actor_id}:{actor_type}:{}", request.method_id),
-            dependencies,
+            format!(
+                "actor:{actor_id}:{}:{}",
+                actor.spec.actor_type, request.method_id
+            ),
+            scheduling_dependencies,
             output_id,
         );
+        spec.target_worker = actor.owner_worker;
         spec.max_retries = request.max_retries;
         let task_id = spec.task_id;
+
+        self.actor_tasks.lock().await.insert(
+            task_id,
+            ActorTaskLeaseMeta {
+                actor_id,
+                actor_type: actor.spec.actor_type,
+                method_id: request.method_id,
+                dependencies: method_dependencies,
+                constructor_dependencies: actor.spec.constructor_dependencies,
+            },
+        );
 
         self.scheduler
             .lock()
@@ -190,15 +232,26 @@ impl Head for HeadService {
     ) -> std::result::Result<Response<PollTaskResponse>, Status> {
         let request = request.into_inner();
         let worker_id = parse_worker_id(&request.worker_id)?;
-        let tasks = self
+        let leased_specs = self
             .scheduler
             .lock()
             .await
             .lease_tasks(worker_id, request.capacity as usize)
-            .map_err(status_from_error)?
-            .into_iter()
-            .map(task_lease_from_spec)
-            .collect();
+            .map_err(status_from_error)?;
+        let mut tasks = Vec::with_capacity(leased_specs.len());
+        for spec in leased_specs {
+            let task_id = spec.task_id;
+            let actor_meta = self.actor_tasks.lock().await.get(&task_id).cloned();
+            if let Some(meta) = &actor_meta {
+                let mut actors = self.actors.lock().await;
+                if let Some(actor) = actors.get_mut(&meta.actor_id) {
+                    if actor.owner_worker.is_none() {
+                        actor.owner_worker = Some(worker_id);
+                    }
+                }
+            }
+            tasks.push(task_lease_from_spec(spec, actor_meta));
+        }
 
         Ok(Response::new(PollTaskResponse { tasks }))
     }
@@ -275,21 +328,45 @@ fn parse_actor_id(value: &str) -> std::result::Result<ActorId, Status> {
     ActorId::from_string(value).map_err(status_from_error)
 }
 
-fn task_lease_from_spec(spec: TaskSpec) -> TaskLease {
+fn task_lease_from_spec(spec: TaskSpec, actor_meta: Option<ActorTaskLeaseMeta>) -> TaskLease {
+    let (actor_id, actor_type, method_id, dependencies, constructor_dependencies) =
+        if let Some(meta) = actor_meta {
+            (
+                meta.actor_id.to_string(),
+                meta.actor_type,
+                meta.method_id,
+                meta.dependencies
+                    .into_iter()
+                    .map(|object_id| object_id.to_string())
+                    .collect(),
+                meta.constructor_dependencies
+                    .into_iter()
+                    .map(|object_id| object_id.to_string())
+                    .collect(),
+            )
+        } else {
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                spec.dependencies
+                    .iter()
+                    .map(|object_id| object_id.to_string())
+                    .collect(),
+                Vec::new(),
+            )
+        };
+
     TaskLease {
         task_id: spec.task_id.to_string(),
         function_id: spec.function_id,
-        dependencies: spec
-            .dependencies
-            .into_iter()
-            .map(|object_id| object_id.to_string())
-            .collect(),
+        dependencies,
         output_id: spec.output_id.to_string(),
         attempt: spec.attempt,
-        actor_id: String::new(),
-        actor_type: String::new(),
-        method_id: String::new(),
-        constructor_dependencies: Vec::new(),
+        actor_id,
+        actor_type,
+        method_id,
+        constructor_dependencies,
     }
 }
 
@@ -588,6 +665,101 @@ mod tests {
         assert_eq!(polled.tasks.len(), 1);
         assert!(polled.tasks[0].function_id.contains("Counter"));
         assert!(polled.tasks[0].function_id.contains("increment"));
+    }
+
+    #[tokio::test]
+    async fn actor_tasks_are_pinned_to_first_worker_that_polls_actor() {
+        let service = HeadService::with_defaults();
+        let actor_id = ActorId::new();
+        let owner = WorkerId::new();
+        let other = WorkerId::new();
+        let first_output = ObjectId::new();
+        let second_output = ObjectId::new();
+
+        for worker_id in [owner, other] {
+            service
+                .register_worker(Request::new(RegisterWorkerRequest {
+                    worker_id: worker_id.to_string(),
+                    slots: 1,
+                }))
+                .await
+                .unwrap();
+        }
+        service
+            .create_actor(Request::new(CreateActorRequest {
+                actor_type: "Counter".to_string(),
+                constructor_dependencies: vec![],
+                actor_id: actor_id.to_string(),
+                max_restarts: 0,
+            }))
+            .await
+            .unwrap();
+        let first = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: first_output.to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first_poll = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: owner.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first_poll.tasks.len(), 1);
+        assert_eq!(first_poll.tasks[0].actor_id, actor_id.to_string());
+        assert_eq!(first_poll.tasks[0].actor_type, "Counter");
+        assert_eq!(first_poll.tasks[0].method_id, "increment");
+
+        service
+            .complete_task(Request::new(CompleteTaskRequest {
+                worker_id: owner.to_string(),
+                task_id: first.task_id,
+                output_id: first_output.to_string(),
+                data: encode(&1u64).unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: second_output.to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap();
+
+        let wrong_worker_poll = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: other.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(wrong_worker_poll.tasks.is_empty());
+
+        let owner_poll = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: owner.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(owner_poll.tasks.len(), 1);
+        assert_eq!(owner_poll.tasks[0].actor_id, actor_id.to_string());
     }
 
     #[tokio::test]
