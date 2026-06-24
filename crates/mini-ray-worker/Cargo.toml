@@ -12,3 +12,7 @@ mini-ray-proto.workspace = true
 mini-ray-runtime.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+
+[dev-dependencies]
+mini-ray-client.workspace = true
+mini-ray-head.workspace = true
