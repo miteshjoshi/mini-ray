@@ -18,6 +18,13 @@ pub struct TaskRecord {
     pub state: TaskState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerExpiry {
+    pub worker_id: WorkerId,
+    pub retried_tasks: Vec<TaskId>,
+    pub failed_tasks: Vec<TaskId>,
+}
+
 #[derive(Debug, Clone)]
 struct WorkerRecord {
     slots: usize,
@@ -195,7 +202,7 @@ impl Scheduler {
         }
     }
 
-    pub fn expire_workers(&mut self) {
+    pub fn expire_workers(&mut self) -> Vec<WorkerExpiry> {
         let now = Instant::now();
         let expired: Vec<WorkerId> = self
             .workers
@@ -209,8 +216,14 @@ impl Scheduler {
             })
             .collect();
 
+        let mut expiries = Vec::with_capacity(expired.len());
         for worker_id in expired {
             if let Some(worker) = self.workers.remove(&worker_id) {
+                let mut expiry = WorkerExpiry {
+                    worker_id,
+                    retried_tasks: Vec::new(),
+                    failed_tasks: Vec::new(),
+                };
                 for task_id in worker.leased {
                     if let Some(record) = self.tasks.get_mut(&task_id) {
                         if matches!(record.state, TaskState::Leased(_) | TaskState::Running(_)) {
@@ -218,15 +231,19 @@ impl Scheduler {
                                 record.spec.attempt += 1;
                                 record.state = TaskState::Ready;
                                 self.ready.push_back(task_id);
+                                expiry.retried_tasks.push(task_id);
                             } else {
                                 record.state =
                                     TaskState::Failed("worker heartbeat expired".to_string());
+                                expiry.failed_tasks.push(task_id);
                             }
                         }
                     }
                 }
+                expiries.push(expiry);
             }
         }
+        expiries
     }
 
     fn dependencies_ready(&self, spec: &TaskSpec) -> bool {
@@ -526,11 +543,55 @@ mod tests {
         scheduler.lease_tasks(worker, 1).unwrap();
         scheduler.force_worker_last_heartbeat(worker, Instant::now() - Duration::from_secs(1));
 
-        scheduler.expire_workers();
+        let expiries = scheduler.expire_workers();
         let retried = scheduler.lease_tasks(replacement, 1).unwrap();
 
+        assert_eq!(
+            expiries,
+            vec![WorkerExpiry {
+                worker_id: worker,
+                retried_tasks: vec![task_id],
+                failed_tasks: vec![],
+            }]
+        );
         assert_eq!(retried.len(), 1);
         assert_eq!(retried[0].task_id, task_id);
         assert_eq!(retried[0].attempt, 1);
+    }
+
+    #[test]
+    fn heartbeat_expiry_reports_task_when_retries_are_exhausted() {
+        let mut scheduler = Scheduler::new(Duration::from_millis(1));
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        let mut spec = TaskSpec::new("noop", vec![], ObjectId::new());
+        spec.max_retries = 0;
+        let task_id = spec.task_id;
+        scheduler.submit(spec).unwrap();
+        scheduler.lease_tasks(worker, 1).unwrap();
+        scheduler.force_worker_last_heartbeat(worker, Instant::now() - Duration::from_secs(1));
+
+        let expiries = scheduler.expire_workers();
+
+        assert_eq!(
+            expiries,
+            vec![WorkerExpiry {
+                worker_id: worker,
+                retried_tasks: vec![],
+                failed_tasks: vec![task_id],
+            }]
+        );
+        assert_eq!(
+            scheduler.task_state(task_id),
+            Some(TaskState::Failed("worker heartbeat expired".to_string()))
+        );
+    }
+
+    #[test]
+    fn expire_workers_returns_empty_report_when_workers_are_healthy() {
+        let mut scheduler = Scheduler::new(Duration::from_secs(10));
+        scheduler.register_worker(WorkerId::new(), 1);
+
+        assert!(scheduler.expire_workers().is_empty());
     }
 }
