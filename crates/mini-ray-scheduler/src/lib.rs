@@ -69,12 +69,18 @@ impl Scheduler {
         }
     }
 
-    pub fn submit(&mut self, spec: TaskSpec) -> Result<()> {
+    pub fn submit(&mut self, mut spec: TaskSpec) -> Result<()> {
         if self.tasks.contains_key(&spec.task_id) {
             return Err(MiniRayError::Scheduler(format!(
                 "task {} already exists",
                 spec.task_id
             )));
+        }
+        if spec
+            .target_worker
+            .is_some_and(|worker_id| !self.workers.contains_key(&worker_id))
+        {
+            spec.target_worker = None;
         }
 
         let state = if self.dependencies_ready(&spec) {
@@ -111,7 +117,6 @@ impl Scheduler {
     }
 
     pub fn lease_tasks(&mut self, worker_id: WorkerId, capacity: usize) -> Result<Vec<TaskSpec>> {
-        self.expire_workers();
         let worker = self
             .workers
             .get(&worker_id)
@@ -218,32 +223,50 @@ impl Scheduler {
 
         let mut expiries = Vec::with_capacity(expired.len());
         for worker_id in expired {
-            if let Some(worker) = self.workers.remove(&worker_id) {
-                let mut expiry = WorkerExpiry {
-                    worker_id,
-                    retried_tasks: Vec::new(),
-                    failed_tasks: Vec::new(),
-                };
-                for task_id in worker.leased {
-                    if let Some(record) = self.tasks.get_mut(&task_id) {
-                        if matches!(record.state, TaskState::Leased(_) | TaskState::Running(_)) {
-                            if record.spec.attempt < record.spec.max_retries {
-                                record.spec.attempt += 1;
-                                record.state = TaskState::Ready;
-                                self.ready.push_back(task_id);
-                                expiry.retried_tasks.push(task_id);
-                            } else {
-                                record.state =
-                                    TaskState::Failed("worker heartbeat expired".to_string());
-                                expiry.failed_tasks.push(task_id);
-                            }
-                        }
-                    }
-                }
+            if let Some(expiry) =
+                self.remove_worker(worker_id, "worker heartbeat expired".to_string())
+            {
                 expiries.push(expiry);
             }
         }
         expiries
+    }
+
+    pub fn remove_worker(
+        &mut self,
+        worker_id: WorkerId,
+        failure_reason: String,
+    ) -> Option<WorkerExpiry> {
+        let worker = self.workers.remove(&worker_id)?;
+        let mut expiry = WorkerExpiry {
+            worker_id,
+            retried_tasks: Vec::new(),
+            failed_tasks: Vec::new(),
+        };
+
+        for record in self.tasks.values_mut() {
+            if record.spec.target_worker == Some(worker_id) {
+                record.spec.target_worker = None;
+            }
+        }
+
+        for task_id in worker.leased {
+            if let Some(record) = self.tasks.get_mut(&task_id) {
+                if matches!(record.state, TaskState::Leased(_) | TaskState::Running(_)) {
+                    if record.spec.attempt < record.spec.max_retries {
+                        record.spec.attempt += 1;
+                        record.state = TaskState::Ready;
+                        self.ready.push_back(task_id);
+                        expiry.retried_tasks.push(task_id);
+                    } else {
+                        record.state = TaskState::Failed(failure_reason.clone());
+                        expiry.failed_tasks.push(task_id);
+                    }
+                }
+            }
+        }
+
+        Some(expiry)
     }
 
     fn dependencies_ready(&self, spec: &TaskSpec) -> bool {
@@ -557,6 +580,54 @@ mod tests {
         assert_eq!(retried.len(), 1);
         assert_eq!(retried[0].task_id, task_id);
         assert_eq!(retried[0].attempt, 1);
+    }
+
+    #[test]
+    fn removing_worker_retries_tasks_and_releases_affinity() {
+        let mut scheduler = Scheduler::default();
+        let owner = WorkerId::new();
+        let replacement = WorkerId::new();
+        scheduler.register_worker(owner, 1);
+        scheduler.register_worker(replacement, 1);
+        let mut spec = TaskSpec::new("actor_method", vec![], ObjectId::new());
+        spec.target_worker = Some(owner);
+        spec.max_retries = 1;
+        let task_id = spec.task_id;
+        scheduler.submit(spec).unwrap();
+        scheduler.lease_tasks(owner, 1).unwrap();
+
+        let expiry = scheduler
+            .remove_worker(owner, "worker unregistered".to_string())
+            .unwrap();
+        let retried = scheduler.lease_tasks(replacement, 1).unwrap();
+
+        assert_eq!(expiry.retried_tasks, vec![task_id]);
+        assert!(expiry.failed_tasks.is_empty());
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].task_id, task_id);
+        assert_eq!(retried[0].target_worker, None);
+    }
+
+    #[test]
+    fn removing_worker_releases_affinity_for_queued_tasks() {
+        let mut scheduler = Scheduler::default();
+        let owner = WorkerId::new();
+        let replacement = WorkerId::new();
+        scheduler.register_worker(owner, 1);
+        scheduler.register_worker(replacement, 1);
+        let mut spec = TaskSpec::new("actor_method", vec![], ObjectId::new());
+        spec.target_worker = Some(owner);
+        let task_id = spec.task_id;
+        scheduler.submit(spec).unwrap();
+
+        scheduler
+            .remove_worker(owner, "worker unregistered".to_string())
+            .unwrap();
+        let leased = scheduler.lease_tasks(replacement, 1).unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].task_id, task_id);
+        assert_eq!(leased[0].target_worker, None);
     }
 
     #[test]

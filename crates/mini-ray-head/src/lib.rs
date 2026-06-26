@@ -8,12 +8,14 @@ use mini_ray_proto::miniray::v1::{
     FailTaskRequest, FailTaskResponse, GetObjectRequest, GetObjectResponse, HeartbeatRequest,
     HeartbeatResponse, PollTaskRequest, PollTaskResponse, PutObjectRequest, PutObjectResponse,
     RegisterWorkerRequest, RegisterWorkerResponse, SubmitActorTaskRequest, SubmitActorTaskResponse,
-    SubmitTaskRequest, SubmitTaskResponse, TaskLease,
+    SubmitTaskRequest, SubmitTaskResponse, TaskLease, UnregisterWorkerRequest,
+    UnregisterWorkerResponse,
 };
 use mini_ray_scheduler::Scheduler;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -62,13 +64,59 @@ impl HeadService {
     pub async fn actor_count(&self) -> usize {
         self.actors.lock().await.len()
     }
+
+    pub async fn cleanup_expired_workers(&self) -> usize {
+        let expiries = self.scheduler.lock().await.expire_workers();
+        let expired_workers: Vec<WorkerId> =
+            expiries.iter().map(|expiry| expiry.worker_id).collect();
+        self.release_actor_owners(&expired_workers).await;
+        expiries.len()
+    }
+
+    async fn remove_worker(&self, worker_id: WorkerId, reason: String) {
+        let removed = self
+            .scheduler
+            .lock()
+            .await
+            .remove_worker(worker_id, reason)
+            .is_some();
+        if removed {
+            self.release_actor_owners(&[worker_id]).await;
+        }
+    }
+
+    async fn release_actor_owners(&self, worker_ids: &[WorkerId]) {
+        if worker_ids.is_empty() {
+            return;
+        }
+
+        for actor in self.actors.lock().await.values_mut() {
+            if actor
+                .owner_worker
+                .is_some_and(|owner| worker_ids.contains(&owner))
+            {
+                actor.owner_worker = None;
+            }
+        }
+    }
 }
 
 pub async fn serve(bind: SocketAddr) -> Result<(), tonic::transport::Error> {
-    Server::builder()
-        .add_service(HeadServer::new(HeadService::with_defaults()))
+    let service = HeadService::with_defaults();
+    let cleanup_service = service.clone();
+    let cleanup_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            cleanup_service.cleanup_expired_workers().await;
+        }
+    });
+    let result = Server::builder()
+        .add_service(HeadServer::new(service))
         .serve(bind)
-        .await
+        .await;
+    cleanup_task.abort();
+    result
 }
 
 #[tonic::async_trait]
@@ -226,12 +274,24 @@ impl Head for HeadService {
         }))
     }
 
+    async fn unregister_worker(
+        &self,
+        request: Request<UnregisterWorkerRequest>,
+    ) -> std::result::Result<Response<UnregisterWorkerResponse>, Status> {
+        let worker_id = parse_worker_id(&request.into_inner().worker_id)?;
+        self.remove_worker(worker_id, "worker unregistered".to_string())
+            .await;
+
+        Ok(Response::new(UnregisterWorkerResponse {}))
+    }
+
     async fn poll_task(
         &self,
         request: Request<PollTaskRequest>,
     ) -> std::result::Result<Response<PollTaskResponse>, Status> {
         let request = request.into_inner();
         let worker_id = parse_worker_id(&request.worker_id)?;
+        self.cleanup_expired_workers().await;
         let leased_specs = self
             .scheduler
             .lock()
@@ -760,6 +820,144 @@ mod tests {
             .into_inner();
         assert_eq!(owner_poll.tasks.len(), 1);
         assert_eq!(owner_poll.tasks[0].actor_id, actor_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn unregistering_worker_releases_actor_to_replacement_worker() {
+        let service = HeadService::with_defaults();
+        let actor_id = ActorId::new();
+        let owner = WorkerId::new();
+        let replacement = WorkerId::new();
+
+        for worker_id in [owner, replacement] {
+            service
+                .register_worker(Request::new(RegisterWorkerRequest {
+                    worker_id: worker_id.to_string(),
+                    slots: 1,
+                }))
+                .await
+                .unwrap();
+        }
+        service
+            .create_actor(Request::new(CreateActorRequest {
+                actor_type: "Counter".to_string(),
+                constructor_dependencies: vec![],
+                actor_id: actor_id.to_string(),
+                max_restarts: 1,
+            }))
+            .await
+            .unwrap();
+        let first_output = ObjectId::new();
+        let first = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: first_output.to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: owner.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap();
+        service
+            .complete_task(Request::new(CompleteTaskRequest {
+                worker_id: owner.to_string(),
+                task_id: first.task_id,
+                output_id: first_output.to_string(),
+                data: encode(&1u64).unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        service
+            .unregister_worker(Request::new(UnregisterWorkerRequest {
+                worker_id: owner.to_string(),
+            }))
+            .await
+            .unwrap();
+        service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: ObjectId::new().to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap();
+
+        let polled = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: replacement.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(polled.tasks.len(), 1);
+        assert_eq!(polled.tasks[0].actor_id, actor_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_workers_retries_leased_task() {
+        let service = HeadService::new(
+            InMemoryObjectStore::new(),
+            Scheduler::new(Duration::from_secs(1)),
+        );
+        let expired = WorkerId::new();
+        let replacement = WorkerId::new();
+        for worker_id in [expired, replacement] {
+            service
+                .register_worker(Request::new(RegisterWorkerRequest {
+                    worker_id: worker_id.to_string(),
+                    slots: 1,
+                }))
+                .await
+                .unwrap();
+        }
+        let submitted = service
+            .submit_task(Request::new(SubmitTaskRequest {
+                function_id: "noop".to_string(),
+                dependencies: vec![],
+                output_id: ObjectId::new().to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: expired.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap();
+        service.scheduler.lock().await.force_worker_last_heartbeat(
+            expired,
+            std::time::Instant::now() - Duration::from_secs(2),
+        );
+
+        assert_eq!(service.cleanup_expired_workers().await, 1);
+        let polled = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: replacement.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(polled.tasks.len(), 1);
+        assert_eq!(polled.tasks[0].task_id, submitted.task_id);
+        assert_eq!(polled.tasks[0].attempt, 1);
     }
 
     #[tokio::test]

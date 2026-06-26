@@ -3,7 +3,7 @@
 use mini_ray_core::{MiniRayError, Result, WorkerId};
 use mini_ray_proto::miniray::v1::{
     head_client::HeadClient, CompleteTaskRequest, FailTaskRequest, GetObjectRequest,
-    HeartbeatRequest, PollTaskRequest, RegisterWorkerRequest, TaskLease,
+    HeartbeatRequest, PollTaskRequest, RegisterWorkerRequest, TaskLease, UnregisterWorkerRequest,
 };
 use mini_ray_runtime::{ActorInstanceStore, ActorRegistry, TaskRegistry};
 use std::time::Duration;
@@ -92,6 +92,16 @@ impl Worker {
         Ok(())
     }
 
+    pub async fn unregister(&mut self) -> Result<()> {
+        self.client
+            .unregister_worker(UnregisterWorkerRequest {
+                worker_id: self.worker_id.to_string(),
+            })
+            .await
+            .map_err(status_error)?;
+        Ok(())
+    }
+
     pub async fn poll_and_execute_once(&mut self) -> Result<usize> {
         let response = self
             .client
@@ -116,17 +126,31 @@ impl Worker {
 
         let mut poll = tokio::time::interval(self.config.poll_interval);
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
+        let shutdown = tokio::signal::ctrl_c();
+        tokio::pin!(shutdown);
 
-        loop {
+        let run_result = loop {
             tokio::select! {
                 _ = poll.tick() => {
-                    self.poll_and_execute_once().await?;
+                    if let Err(error) = self.poll_and_execute_once().await {
+                        break Err(error);
+                    }
                 }
                 _ = heartbeat.tick() => {
-                    self.heartbeat().await?;
+                    if let Err(error) = self.heartbeat().await {
+                        break Err(error);
+                    }
+                }
+                result = &mut shutdown => {
+                    break result
+                        .map_err(|error| MiniRayError::Transport(error.to_string()));
                 }
             }
-        }
+        };
+
+        let cleanup_result = self.unregister().await;
+        run_result?;
+        cleanup_result
     }
 
     async fn execute_remote_lease(&mut self, lease: TaskLease) -> Result<()> {
