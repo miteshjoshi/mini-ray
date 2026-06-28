@@ -142,10 +142,42 @@ impl Client {
             .await
     }
 
+    pub async fn create_actor_with_restarts<Actor, Arg>(
+        &self,
+        actor_type: impl Into<String>,
+        constructor_dependencies: Vec<ObjectRef<Arg>>,
+        max_restarts: u32,
+    ) -> Result<ActorRef<Actor>>
+    where
+        Actor: 'static,
+        Arg: 'static,
+    {
+        let constructor_dependencies = constructor_dependencies
+            .into_iter()
+            .map(|object_ref| object_ref.erase())
+            .collect();
+
+        self.create_actor_refs_with_restarts(actor_type, constructor_dependencies, max_restarts)
+            .await
+    }
+
     pub async fn create_actor_refs<Actor>(
         &self,
         actor_type: impl Into<String>,
         constructor_dependencies: Vec<ObjectRef<()>>,
+    ) -> Result<ActorRef<Actor>>
+    where
+        Actor: 'static,
+    {
+        self.create_actor_refs_with_restarts(actor_type, constructor_dependencies, 0)
+            .await
+    }
+
+    pub async fn create_actor_refs_with_restarts<Actor>(
+        &self,
+        actor_type: impl Into<String>,
+        constructor_dependencies: Vec<ObjectRef<()>>,
+        max_restarts: u32,
     ) -> Result<ActorRef<Actor>>
     where
         Actor: 'static,
@@ -155,7 +187,7 @@ impl Client {
             actor_type: actor_type.into(),
             constructor_dependencies: object_ref_ids(constructor_dependencies),
             actor_id: actor_id.to_string(),
-            max_restarts: 0,
+            max_restarts,
         };
 
         let response = self

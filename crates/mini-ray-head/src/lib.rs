@@ -31,7 +31,16 @@ pub struct HeadService {
 #[derive(Debug, Clone)]
 struct ActorRecord {
     spec: ActorSpec,
-    owner_worker: Option<WorkerId>,
+    state: ActorState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActorState {
+    Alive {
+        owner_worker: Option<WorkerId>,
+        restarts: u32,
+    },
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +78,8 @@ impl HeadService {
         let expiries = self.scheduler.lock().await.expire_workers();
         let expired_workers: Vec<WorkerId> =
             expiries.iter().map(|expiry| expiry.worker_id).collect();
-        self.release_actor_owners(&expired_workers).await;
+        self.recover_actors_owned_by(&expired_workers, "worker heartbeat expired")
+            .await;
         expiries.len()
     }
 
@@ -81,23 +91,67 @@ impl HeadService {
             .remove_worker(worker_id, reason)
             .is_some();
         if removed {
-            self.release_actor_owners(&[worker_id]).await;
+            self.recover_actors_owned_by(&[worker_id], "worker unregistered")
+                .await;
         }
     }
 
-    async fn release_actor_owners(&self, worker_ids: &[WorkerId]) {
+    async fn recover_actors_owned_by(&self, worker_ids: &[WorkerId], reason: &str) {
         if worker_ids.is_empty() {
             return;
         }
 
-        for actor in self.actors.lock().await.values_mut() {
-            if actor
-                .owner_worker
-                .is_some_and(|owner| worker_ids.contains(&owner))
-            {
-                actor.owner_worker = None;
+        let mut failed_actors = Vec::new();
+        {
+            let mut actors = self.actors.lock().await;
+            for actor in actors.values_mut() {
+                let ActorState::Alive {
+                    owner_worker,
+                    restarts,
+                } = &mut actor.state
+                else {
+                    continue;
+                };
+
+                if !owner_worker.is_some_and(|owner| worker_ids.contains(&owner)) {
+                    continue;
+                }
+
+                if *restarts < actor.spec.max_restarts {
+                    *restarts += 1;
+                    *owner_worker = None;
+                } else {
+                    let error = format!(
+                        "actor {} failed after exhausting {} restarts: {reason}",
+                        actor.spec.actor_id, actor.spec.max_restarts
+                    );
+                    actor.state = ActorState::Failed(error);
+                    failed_actors.push(actor.spec.actor_id);
+                }
             }
         }
+
+        if failed_actors.is_empty() {
+            return;
+        }
+
+        let actor_tasks = self.actor_tasks.lock().await;
+        let failed_task_ids: Vec<TaskId> = actor_tasks
+            .iter()
+            .filter_map(|(task_id, meta)| {
+                if failed_actors.contains(&meta.actor_id) {
+                    Some(*task_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        drop(actor_tasks);
+
+        self.scheduler.lock().await.fail_tasks(
+            &failed_task_ids,
+            "actor restart budget exhausted".to_string(),
+        );
     }
 }
 
@@ -194,7 +248,10 @@ impl Head for HeadService {
             actor_id,
             ActorRecord {
                 spec,
-                owner_worker: None,
+                state: ActorState::Alive {
+                    owner_worker: None,
+                    restarts: 0,
+                },
             },
         );
 
@@ -216,11 +273,15 @@ impl Head for HeadService {
             .get(&actor_id)
             .cloned()
             .ok_or_else(|| Status::not_found(format!("actor {actor_id} was not found")))?;
+        let owner_worker = match &actor.state {
+            ActorState::Alive { owner_worker, .. } => *owner_worker,
+            ActorState::Failed(error) => return Err(Status::failed_precondition(error.clone())),
+        };
 
         let output_id = parse_object_id(&request.output_id)?;
         let method_dependencies = parse_object_ids(request.dependencies)?;
         let mut scheduling_dependencies = method_dependencies.clone();
-        if actor.owner_worker.is_none() {
+        if owner_worker.is_none() {
             scheduling_dependencies.extend(actor.spec.constructor_dependencies.iter().copied());
         }
         let mut spec = TaskSpec::new(
@@ -231,26 +292,24 @@ impl Head for HeadService {
             scheduling_dependencies,
             output_id,
         );
-        spec.target_worker = actor.owner_worker;
+        spec.target_worker = owner_worker;
         spec.max_retries = request.max_retries;
         let task_id = spec.task_id;
 
-        self.actor_tasks.lock().await.insert(
-            task_id,
-            ActorTaskLeaseMeta {
-                actor_id,
-                actor_type: actor.spec.actor_type,
-                method_id: request.method_id,
-                dependencies: method_dependencies,
-                constructor_dependencies: actor.spec.constructor_dependencies,
-            },
-        );
+        let actor_task = ActorTaskLeaseMeta {
+            actor_id,
+            actor_type: actor.spec.actor_type,
+            method_id: request.method_id,
+            dependencies: method_dependencies,
+            constructor_dependencies: actor.spec.constructor_dependencies,
+        };
 
         self.scheduler
             .lock()
             .await
             .submit(spec)
             .map_err(status_from_error)?;
+        self.actor_tasks.lock().await.insert(task_id, actor_task);
 
         Ok(Response::new(SubmitActorTaskResponse {
             task_id: task_id.to_string(),
@@ -305,8 +364,10 @@ impl Head for HeadService {
             if let Some(meta) = &actor_meta {
                 let mut actors = self.actors.lock().await;
                 if let Some(actor) = actors.get_mut(&meta.actor_id) {
-                    if actor.owner_worker.is_none() {
-                        actor.owner_worker = Some(worker_id);
+                    if let ActorState::Alive { owner_worker, .. } = &mut actor.state {
+                        if owner_worker.is_none() {
+                            *owner_worker = Some(worker_id);
+                        }
                     }
                 }
             }
@@ -446,6 +507,7 @@ fn status_from_error(error: MiniRayError) -> Status {
 mod tests {
     use super::*;
     use mini_ray_core::{decode, encode};
+    use mini_ray_scheduler::TaskState;
 
     #[tokio::test]
     async fn put_and_get_object_round_trip() {
@@ -828,6 +890,7 @@ mod tests {
         let actor_id = ActorId::new();
         let owner = WorkerId::new();
         let replacement = WorkerId::new();
+        let initial = ObjectId::new();
 
         for worker_id in [owner, replacement] {
             service
@@ -839,9 +902,16 @@ mod tests {
                 .unwrap();
         }
         service
+            .put_object(Request::new(PutObjectRequest {
+                object_id: initial.to_string(),
+                data: encode(&0u64).unwrap(),
+            }))
+            .await
+            .unwrap();
+        service
             .create_actor(Request::new(CreateActorRequest {
                 actor_type: "Counter".to_string(),
-                constructor_dependencies: vec![],
+                constructor_dependencies: vec![initial.to_string()],
                 actor_id: actor_id.to_string(),
                 max_restarts: 1,
             }))
@@ -904,6 +974,90 @@ mod tests {
 
         assert_eq!(polled.tasks.len(), 1);
         assert_eq!(polled.tasks[0].actor_id, actor_id.to_string());
+        assert_eq!(
+            polled.tasks[0].constructor_dependencies,
+            vec![initial.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistering_worker_fails_actor_when_restart_budget_is_exhausted() {
+        let service = HeadService::with_defaults();
+        let actor_id = ActorId::new();
+        let owner = WorkerId::new();
+        let replacement = WorkerId::new();
+
+        for worker_id in [owner, replacement] {
+            service
+                .register_worker(Request::new(RegisterWorkerRequest {
+                    worker_id: worker_id.to_string(),
+                    slots: 1,
+                }))
+                .await
+                .unwrap();
+        }
+        service
+            .create_actor(Request::new(CreateActorRequest {
+                actor_type: "Counter".to_string(),
+                constructor_dependencies: vec![],
+                actor_id: actor_id.to_string(),
+                max_restarts: 0,
+            }))
+            .await
+            .unwrap();
+        let submitted = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: ObjectId::new().to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: owner.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap();
+
+        service
+            .unregister_worker(Request::new(UnregisterWorkerRequest {
+                worker_id: owner.to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let retry = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: replacement.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(retry.tasks.is_empty());
+
+        let task_id = TaskId::from_string(&submitted.task_id).unwrap();
+        assert!(matches!(
+            service.scheduler.lock().await.task_state(task_id),
+            Some(TaskState::Failed(_))
+        ));
+
+        let err = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: ObjectId::new().to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

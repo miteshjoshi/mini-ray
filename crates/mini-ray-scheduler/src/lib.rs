@@ -197,6 +197,36 @@ impl Scheduler {
         Ok(())
     }
 
+    pub fn fail_tasks(&mut self, task_ids: &[TaskId], error: String) -> Vec<TaskId> {
+        let mut failed = Vec::new();
+
+        for task_id in task_ids {
+            let Some(state) = self.tasks.get(task_id).map(|record| record.state.clone()) else {
+                continue;
+            };
+
+            match state {
+                TaskState::Finished | TaskState::Failed(_) => {}
+                TaskState::Pending | TaskState::Ready => {
+                    self.ready.retain(|ready| ready != task_id);
+                    if let Some(record) = self.tasks.get_mut(task_id) {
+                        record.state = TaskState::Failed(error.clone());
+                        failed.push(*task_id);
+                    }
+                }
+                TaskState::Leased(worker_id) | TaskState::Running(worker_id) => {
+                    self.remove_worker_lease(worker_id, *task_id);
+                    if let Some(record) = self.tasks.get_mut(task_id) {
+                        record.state = TaskState::Failed(error.clone());
+                        failed.push(*task_id);
+                    }
+                }
+            }
+        }
+
+        failed
+    }
+
     pub fn task_state(&self, task_id: TaskId) -> Option<TaskState> {
         self.tasks.get(&task_id).map(|record| record.state.clone())
     }
@@ -628,6 +658,38 @@ mod tests {
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0].task_id, task_id);
         assert_eq!(leased[0].target_worker, None);
+    }
+
+    #[test]
+    fn fail_tasks_removes_ready_and_leased_tasks_from_scheduling() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        let replacement = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        scheduler.register_worker(replacement, 1);
+
+        let ready = TaskSpec::new("ready", vec![], ObjectId::new());
+        let ready_id = ready.task_id;
+        scheduler.submit(ready).unwrap();
+
+        let leased = TaskSpec::new("leased", vec![], ObjectId::new());
+        let leased_id = leased.task_id;
+        scheduler.submit(leased).unwrap();
+        scheduler.lease_tasks(worker, 1).unwrap();
+
+        let failed = scheduler.fail_tasks(&[ready_id, leased_id], "actor failed".to_string());
+        let replacement_tasks = scheduler.lease_tasks(replacement, 2).unwrap();
+
+        assert_eq!(failed, vec![ready_id, leased_id]);
+        assert_eq!(
+            scheduler.task_state(ready_id),
+            Some(TaskState::Failed("actor failed".to_string()))
+        );
+        assert_eq!(
+            scheduler.task_state(leased_id),
+            Some(TaskState::Failed("actor failed".to_string()))
+        );
+        assert!(replacement_tasks.is_empty());
     }
 
     #[test]
