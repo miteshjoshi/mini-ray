@@ -267,7 +267,11 @@ fn transport_error(error: tonic::transport::Error) -> MiniRayError {
 }
 
 fn status_error(error: tonic::Status) -> MiniRayError {
-    MiniRayError::Transport(error.to_string())
+    match error.code() {
+        tonic::Code::FailedPrecondition => MiniRayError::TaskFailed(error.message().to_string()),
+        tonic::Code::NotFound => MiniRayError::Transport(error.message().to_string()),
+        _ => MiniRayError::Transport(error.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +286,15 @@ mod tests {
         let ids = object_ref_ids(vec![first, second]);
 
         assert_eq!(ids, vec![first.id().to_string(), second.id().to_string()]);
+    }
+
+    #[test]
+    fn failed_precondition_status_maps_to_task_failed() {
+        let err = status_error(tonic::Status::failed_precondition("object output failed"));
+
+        assert!(matches!(
+            err,
+            MiniRayError::TaskFailed(message) if message == "object output failed"
+        ));
     }
 }

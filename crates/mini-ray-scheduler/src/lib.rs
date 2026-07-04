@@ -231,6 +231,20 @@ impl Scheduler {
         self.tasks.get(&task_id).map(|record| record.state.clone())
     }
 
+    pub fn output_failure(&self, output_id: ObjectId) -> Option<(TaskId, String)> {
+        self.tasks.iter().find_map(|(task_id, record)| {
+            if record.spec.output_id == output_id {
+                if let TaskState::Failed(error) = &record.state {
+                    Some((*task_id, error.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn force_worker_last_heartbeat(&mut self, worker_id: WorkerId, last_heartbeat: Instant) {
         if let Some(worker) = self.workers.get_mut(&worker_id) {
             worker.last_heartbeat = last_heartbeat;
@@ -560,6 +574,28 @@ mod tests {
         assert_eq!(
             scheduler.task_state(task_id),
             Some(TaskState::Failed("boom again".to_string()))
+        );
+    }
+
+    #[test]
+    fn output_failure_reports_final_producer_error() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        let output_id = ObjectId::new();
+        let mut spec = TaskSpec::new("flaky", vec![], output_id);
+        spec.max_retries = 0;
+        let task_id = spec.task_id;
+        scheduler.submit(spec).unwrap();
+        scheduler.lease_tasks(worker, 1).unwrap();
+
+        scheduler
+            .fail(worker, task_id, "handler crashed".to_string())
+            .unwrap();
+
+        assert_eq!(
+            scheduler.output_failure(output_id),
+            Some((task_id, "handler crashed".to_string()))
         );
     }
 

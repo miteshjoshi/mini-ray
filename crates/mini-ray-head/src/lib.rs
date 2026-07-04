@@ -195,11 +195,20 @@ impl Head for HeadService {
         request: Request<GetObjectRequest>,
     ) -> std::result::Result<Response<GetObjectResponse>, Status> {
         let object_id = parse_object_id(&request.into_inner().object_id)?;
-        let data = self
-            .object_store
-            .get_bytes(object_id)
-            .await
-            .map_err(status_from_error)?;
+        let data = match self.object_store.get_bytes(object_id).await {
+            Ok(data) => data,
+            Err(MiniRayError::MissingObject(_)) => {
+                if let Some((task_id, error)) =
+                    self.scheduler.lock().await.output_failure(object_id)
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "object {object_id} is unavailable because task {task_id} failed: {error}"
+                    )));
+                }
+                return Err(status_from_error(MiniRayError::MissingObject(object_id)));
+            }
+            Err(error) => return Err(status_from_error(error)),
+        };
 
         Ok(Response::new(GetObjectResponse {
             object_id: object_id.to_string(),
@@ -626,6 +635,57 @@ mod tests {
         let value: u64 = decode(&response.data).unwrap();
 
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn get_object_reports_failed_producer_task() {
+        let service = HeadService::with_defaults();
+        let worker_id = WorkerId::new();
+        let output_id = ObjectId::new();
+
+        service
+            .register_worker(Request::new(RegisterWorkerRequest {
+                worker_id: worker_id.to_string(),
+                slots: 1,
+            }))
+            .await
+            .unwrap();
+        let submitted = service
+            .submit_task(Request::new(SubmitTaskRequest {
+                function_id: "fail".to_string(),
+                dependencies: vec![],
+                output_id: output_id.to_string(),
+                max_retries: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker_id.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap();
+        service
+            .fail_task(Request::new(FailTaskRequest {
+                worker_id: worker_id.to_string(),
+                task_id: submitted.task_id,
+                error: "handler crashed".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let err = service
+            .get_object(Request::new(GetObjectRequest {
+                object_id: output_id.to_string(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("handler crashed"));
+        assert!(err.message().contains(&output_id.to_string()));
     }
 
     #[tokio::test]
