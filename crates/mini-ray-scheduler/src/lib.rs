@@ -1,4 +1,4 @@
-use mini_ray_core::{MiniRayError, ObjectId, Result, TaskId, TaskSpec, WorkerId};
+use mini_ray_core::{ActorId, MiniRayError, ObjectId, Result, TaskId, TaskSpec, WorkerId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -334,7 +334,8 @@ impl Scheduler {
             .iter()
             .position(|task_id| {
                 self.tasks.get(task_id).is_some_and(|record| {
-                    matches!(record.state, TaskState::Leased(_)) && self.can_run(record, thief)
+                    matches!(record.state, TaskState::Leased(_))
+                        && self.can_run(*task_id, record, thief)
                 })
             })?;
         let victim = self.workers.get_mut(&victim_id)?;
@@ -349,16 +350,53 @@ impl Scheduler {
         let index = self.ready.iter().position(|task_id| {
             self.tasks
                 .get(task_id)
-                .is_some_and(|record| self.can_run(record, worker_id))
+                .is_some_and(|record| self.can_run(*task_id, record, worker_id))
         })?;
         self.ready.remove(index)
     }
 
-    fn can_run(&self, record: &TaskRecord, worker_id: WorkerId) -> bool {
-        match record.spec.target_worker {
+    fn can_run(&self, task_id: TaskId, record: &TaskRecord, worker_id: WorkerId) -> bool {
+        let placement_matches = match record.spec.target_worker {
             Some(target) => target == worker_id,
             None => true,
+        };
+
+        placement_matches && self.actor_turn_available(task_id, &record.spec)
+    }
+
+    fn actor_turn_available(&self, task_id: TaskId, spec: &TaskSpec) -> bool {
+        match (spec.actor_id, spec.actor_sequence) {
+            (Some(actor_id), Some(sequence)) => {
+                self.actor_is_idle(task_id, actor_id)
+                    && self.no_lower_actor_sequence_is_active(task_id, actor_id, sequence)
+            }
+            _ => true,
         }
+    }
+
+    fn actor_is_idle(&self, task_id: TaskId, actor_id: ActorId) -> bool {
+        !self.tasks.iter().any(|(other_task_id, other)| {
+            *other_task_id != task_id
+                && other.spec.actor_id == Some(actor_id)
+                && matches!(other.state, TaskState::Leased(_) | TaskState::Running(_))
+        })
+    }
+
+    fn no_lower_actor_sequence_is_active(
+        &self,
+        task_id: TaskId,
+        actor_id: ActorId,
+        sequence: u64,
+    ) -> bool {
+        !self.tasks.iter().any(|(other_task_id, other)| {
+            *other_task_id != task_id
+                && other.spec.actor_id == Some(actor_id)
+                && other
+                    .spec
+                    .actor_sequence
+                    .is_some_and(|other_sequence| other_sequence < sequence)
+                && !matches!(other.state, TaskState::Finished | TaskState::Failed(_))
+        })
     }
 
     fn remove_worker_lease(&mut self, worker_id: WorkerId, task_id: TaskId) {
@@ -480,6 +518,170 @@ mod tests {
             scheduler.task_state(leased_to_target[0].task_id),
             Some(TaskState::Leased(target))
         );
+    }
+
+    fn actor_task(
+        actor_id: ActorId,
+        sequence: u64,
+        dependencies: Vec<ObjectId>,
+        output_id: ObjectId,
+    ) -> TaskSpec {
+        let mut spec = TaskSpec::new("actor_method", dependencies, output_id);
+        spec.actor_id = Some(actor_id);
+        spec.actor_sequence = Some(sequence);
+        spec
+    }
+
+    #[test]
+    fn actor_tasks_lease_in_sequence_order() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        let actor_id = ActorId::new();
+        scheduler.register_worker(worker, 2);
+
+        let first_output = ObjectId::new();
+        let first = actor_task(actor_id, 0, vec![], first_output);
+        let first_id = first.task_id;
+        scheduler.submit(first).unwrap();
+
+        let second = actor_task(actor_id, 1, vec![], ObjectId::new());
+        let second_id = second.task_id;
+        scheduler.submit(second).unwrap();
+
+        let first_batch = scheduler.lease_tasks(worker, 2).unwrap();
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(first_batch[0].task_id, first_id);
+
+        scheduler.complete(worker, first_id, first_output).unwrap();
+        let second_batch = scheduler.lease_tasks(worker, 2).unwrap();
+
+        assert_eq!(second_batch.len(), 1);
+        assert_eq!(second_batch[0].task_id, second_id);
+    }
+
+    #[test]
+    fn later_actor_task_waits_behind_pending_lower_sequence() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        let actor_id = ActorId::new();
+        let dependency = ObjectId::new();
+        scheduler.register_worker(worker, 2);
+
+        let first = actor_task(actor_id, 0, vec![dependency], ObjectId::new());
+        let first_id = first.task_id;
+        scheduler.submit(first).unwrap();
+
+        let second = actor_task(actor_id, 1, vec![], ObjectId::new());
+        let second_id = second.task_id;
+        scheduler.submit(second).unwrap();
+
+        assert!(scheduler.lease_tasks(worker, 2).unwrap().is_empty());
+        assert_eq!(scheduler.task_state(first_id), Some(TaskState::Pending));
+        assert_eq!(scheduler.task_state(second_id), Some(TaskState::Ready));
+    }
+
+    #[test]
+    fn later_actor_task_leases_after_lower_sequence_completes() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        let actor_id = ActorId::new();
+        scheduler.register_worker(worker, 1);
+
+        let first_output = ObjectId::new();
+        let first = actor_task(actor_id, 0, vec![], first_output);
+        let first_id = first.task_id;
+        scheduler.submit(first).unwrap();
+
+        let second = actor_task(actor_id, 1, vec![], ObjectId::new());
+        let second_id = second.task_id;
+        scheduler.submit(second).unwrap();
+
+        assert_eq!(
+            scheduler.lease_tasks(worker, 1).unwrap()[0].task_id,
+            first_id
+        );
+        scheduler.complete(worker, first_id, first_output).unwrap();
+
+        let leased = scheduler.lease_tasks(worker, 1).unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].task_id, second_id);
+    }
+
+    #[test]
+    fn later_actor_task_leases_after_lower_sequence_fails_terminally() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        let actor_id = ActorId::new();
+        scheduler.register_worker(worker, 1);
+
+        let mut first = actor_task(actor_id, 0, vec![], ObjectId::new());
+        first.max_retries = 0;
+        let first_id = first.task_id;
+        scheduler.submit(first).unwrap();
+
+        let second = actor_task(actor_id, 1, vec![], ObjectId::new());
+        let second_id = second.task_id;
+        scheduler.submit(second).unwrap();
+
+        assert_eq!(
+            scheduler.lease_tasks(worker, 1).unwrap()[0].task_id,
+            first_id
+        );
+
+        scheduler
+            .fail(worker, first_id, "method failed".to_string())
+            .unwrap();
+        let leased = scheduler.lease_tasks(worker, 1).unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].task_id, second_id);
+    }
+
+    #[test]
+    fn different_actors_can_lease_independently() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 2);
+
+        let first_actor = actor_task(ActorId::new(), 0, vec![], ObjectId::new());
+        let first_id = first_actor.task_id;
+        scheduler.submit(first_actor).unwrap();
+
+        let second_actor = actor_task(ActorId::new(), 0, vec![], ObjectId::new());
+        let second_id = second_actor.task_id;
+        scheduler.submit(second_actor).unwrap();
+
+        let leased = scheduler.lease_tasks(worker, 2).unwrap();
+        let leased_ids: HashSet<TaskId> = leased.iter().map(|spec| spec.task_id).collect();
+
+        assert_eq!(leased.len(), 2);
+        assert_eq!(leased_ids, HashSet::from([first_id, second_id]));
+    }
+
+    #[test]
+    fn actor_ordering_does_not_block_normal_tasks() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        let actor_id = ActorId::new();
+        let dependency = ObjectId::new();
+        scheduler.register_worker(worker, 2);
+
+        scheduler
+            .submit(actor_task(actor_id, 0, vec![dependency], ObjectId::new()))
+            .unwrap();
+        scheduler
+            .submit(actor_task(actor_id, 1, vec![], ObjectId::new()))
+            .unwrap();
+
+        let normal = TaskSpec::new("noop", vec![], ObjectId::new());
+        let normal_id = normal.task_id;
+        scheduler.submit(normal).unwrap();
+
+        let leased = scheduler.lease_tasks(worker, 2).unwrap();
+
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].task_id, normal_id);
     }
 
     #[test]

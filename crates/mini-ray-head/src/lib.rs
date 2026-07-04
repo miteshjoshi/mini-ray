@@ -32,6 +32,7 @@ pub struct HeadService {
 struct ActorRecord {
     spec: ActorSpec,
     state: ActorState,
+    next_actor_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +262,7 @@ impl Head for HeadService {
                     owner_worker: None,
                     restarts: 0,
                 },
+                next_actor_sequence: 0,
             },
         );
 
@@ -275,42 +277,50 @@ impl Head for HeadService {
     ) -> std::result::Result<Response<SubmitActorTaskResponse>, Status> {
         let request = request.into_inner();
         let actor_id = parse_actor_id(&request.actor_id)?;
-        let actor = self
-            .actors
-            .lock()
-            .await
-            .get(&actor_id)
-            .cloned()
-            .ok_or_else(|| Status::not_found(format!("actor {actor_id} was not found")))?;
-        let owner_worker = match &actor.state {
-            ActorState::Alive { owner_worker, .. } => *owner_worker,
-            ActorState::Failed(error) => return Err(Status::failed_precondition(error.clone())),
-        };
-
         let output_id = parse_object_id(&request.output_id)?;
         let method_dependencies = parse_object_ids(request.dependencies)?;
+        let (owner_worker, actor_type, constructor_dependencies, actor_sequence) = {
+            let mut actors = self.actors.lock().await;
+            let actor = actors
+                .get_mut(&actor_id)
+                .ok_or_else(|| Status::not_found(format!("actor {actor_id} was not found")))?;
+            let owner_worker = match &actor.state {
+                ActorState::Alive { owner_worker, .. } => *owner_worker,
+                ActorState::Failed(error) => {
+                    return Err(Status::failed_precondition(error.clone()));
+                }
+            };
+            let actor_sequence = actor.next_actor_sequence;
+            actor.next_actor_sequence += 1;
+            (
+                owner_worker,
+                actor.spec.actor_type.clone(),
+                actor.spec.constructor_dependencies.clone(),
+                actor_sequence,
+            )
+        };
+
         let mut scheduling_dependencies = method_dependencies.clone();
         if owner_worker.is_none() {
-            scheduling_dependencies.extend(actor.spec.constructor_dependencies.iter().copied());
+            scheduling_dependencies.extend(constructor_dependencies.iter().copied());
         }
         let mut spec = TaskSpec::new(
-            format!(
-                "actor:{actor_id}:{}:{}",
-                actor.spec.actor_type, request.method_id
-            ),
+            format!("actor:{actor_id}:{actor_type}:{}", request.method_id),
             scheduling_dependencies,
             output_id,
         );
         spec.target_worker = owner_worker;
+        spec.actor_id = Some(actor_id);
+        spec.actor_sequence = Some(actor_sequence);
         spec.max_retries = request.max_retries;
         let task_id = spec.task_id;
 
         let actor_task = ActorTaskLeaseMeta {
             actor_id,
-            actor_type: actor.spec.actor_type,
+            actor_type,
             method_id: request.method_id,
             dependencies: method_dependencies,
-            constructor_dependencies: actor.spec.constructor_dependencies,
+            constructor_dependencies,
         };
 
         self.scheduler
@@ -942,6 +952,185 @@ mod tests {
             .into_inner();
         assert_eq!(owner_poll.tasks.len(), 1);
         assert_eq!(owner_poll.tasks[0].actor_id, actor_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn actor_methods_are_leased_one_at_a_time() {
+        let service = HeadService::with_defaults();
+        let actor_id = ActorId::new();
+        let worker_id = WorkerId::new();
+        let first_output = ObjectId::new();
+        let second_output = ObjectId::new();
+
+        service
+            .register_worker(Request::new(RegisterWorkerRequest {
+                worker_id: worker_id.to_string(),
+                slots: 2,
+            }))
+            .await
+            .unwrap();
+        service
+            .create_actor(Request::new(CreateActorRequest {
+                actor_type: "Counter".to_string(),
+                constructor_dependencies: vec![],
+                actor_id: actor_id.to_string(),
+                max_restarts: 0,
+            }))
+            .await
+            .unwrap();
+        let first = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: first_output.to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let second = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: second_output.to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first_poll = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker_id.to_string(),
+                capacity: 2,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first_poll.tasks.len(), 1);
+        assert_eq!(first_poll.tasks[0].task_id, first.task_id);
+
+        service
+            .complete_task(Request::new(CompleteTaskRequest {
+                worker_id: worker_id.to_string(),
+                task_id: first.task_id,
+                output_id: first_output.to_string(),
+                data: encode(&1u64).unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        let second_poll = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker_id.to_string(),
+                capacity: 2,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second_poll.tasks.len(), 1);
+        assert_eq!(second_poll.tasks[0].task_id, second.task_id);
+    }
+
+    #[tokio::test]
+    async fn later_ready_actor_method_waits_behind_earlier_pending_method() {
+        let service = HeadService::with_defaults();
+        let actor_id = ActorId::new();
+        let worker_id = WorkerId::new();
+        let dependency = ObjectId::new();
+        let first_output = ObjectId::new();
+        let second_output = ObjectId::new();
+
+        service
+            .register_worker(Request::new(RegisterWorkerRequest {
+                worker_id: worker_id.to_string(),
+                slots: 2,
+            }))
+            .await
+            .unwrap();
+        service
+            .create_actor(Request::new(CreateActorRequest {
+                actor_type: "Counter".to_string(),
+                constructor_dependencies: vec![],
+                actor_id: actor_id.to_string(),
+                max_restarts: 0,
+            }))
+            .await
+            .unwrap();
+        let first = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![dependency.to_string()],
+                output_id: first_output.to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let second = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: second_output.to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let blocked_poll = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker_id.to_string(),
+                capacity: 2,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(blocked_poll.tasks.is_empty());
+
+        service
+            .put_object(Request::new(PutObjectRequest {
+                object_id: dependency.to_string(),
+                data: encode(&1u64).unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        let first_poll = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker_id.to_string(),
+                capacity: 2,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first_poll.tasks.len(), 1);
+        assert_eq!(first_poll.tasks[0].task_id, first.task_id);
+
+        service
+            .complete_task(Request::new(CompleteTaskRequest {
+                worker_id: worker_id.to_string(),
+                task_id: first.task_id,
+                output_id: first_output.to_string(),
+                data: encode(&2u64).unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        let second_poll = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker_id.to_string(),
+                capacity: 2,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second_poll.tasks.len(), 1);
+        assert_eq!(second_poll.tasks[0].task_id, second.task_id);
     }
 
     #[tokio::test]

@@ -221,6 +221,8 @@ pub struct TaskSpec {
     pub dependencies: Vec<ObjectId>,
     pub output_id: ObjectId,
     pub target_worker: Option<WorkerId>,
+    pub actor_id: Option<ActorId>,
+    pub actor_sequence: Option<u64>,
     pub max_retries: u32,
     pub attempt: u32,
 }
@@ -237,6 +239,8 @@ impl TaskSpec {
             dependencies,
             output_id,
             target_worker: None,
+            actor_id: None,
+            actor_sequence: None,
             max_retries: 1,
             attempt: 0,
         }
