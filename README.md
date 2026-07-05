@@ -2,15 +2,15 @@
 
 A small Rust-native distributed task framework inspired by Ray.
 
-This project is an educational MVP for learning how a Ray-like system can be built from first principles in Rust. The initial design focuses on remote task submission, typed object references, centralized in-memory object storage, worker execution, and a basic scheduler.
+This project is an educational MVP for learning how a Ray-like system can be built from first principles in Rust. The current design focuses on remote task submission, typed object references, centralized in-memory object storage, worker execution, actors, and a basic scheduler.
 
-## Planned API
+## API Sketch
 
 ```rust
-let cluster = mini_ray::connect("http://127.0.0.1:50051").await?;
+let cluster = mini_ray_client::connect("http://127.0.0.1:50051").await?;
 
 let input: ObjectRef<u64> = cluster.put(41u64).await?;
-let output: ObjectRef<u64> = cluster.submit("add_one", vec![input]).await?;
+let output: ObjectRef<u64> = cluster.submit::<u64, u64>("add_one", vec![input]).await?;
 
 let result: u64 = cluster.get(output).await?;
 ```
@@ -21,18 +21,45 @@ let result: u64 = cluster.get(output).await?;
 - `mini-ray-proto`: gRPC protobuf contracts and generated tonic bindings
 - `mini-ray-object-store`: in-memory object storage by object ID
 - `mini-ray-scheduler`: task lifecycle, dependency tracking, worker leases, and work stealing
-- `mini-ray-runtime`: planned worker-side task registry and execution engine
-- `mini-ray-head`: planned head-node service
-- `mini-ray-worker`: planned worker binary
-- `mini-ray-client`: planned user-facing Rust client API
+- `mini-ray-runtime`: worker-side task and actor registry plus execution engine
+- `mini-ray-head`: head-node gRPC service for objects, task submission, actors, leases, and worker heartbeats
+- `mini-ray-worker`: worker binary that registers task and actor handlers, polls leases, executes them, and reports results
+- `mini-ray-client`: user-facing Rust client API
 
 ## Current Status
 
-Early scaffold. Core types, protobuf contracts, object store, and scheduler are being built one file at a time.
+mini-ray can run simple remote tasks and single-threaded actors end to end. Actor method calls are sequenced per actor: later methods wait behind lower-sequence methods until those methods finish or fail terminally, while different actors and normal tasks can schedule independently.
+
+The object store is still centralized and in-memory, worker execution is intentionally small, and the project remains an educational MVP rather than a production runtime.
+
+## Running Locally
+
+Start the head:
+
+```sh
+cargo run -p mini-ray-head
+```
+
+Start a worker in another shell:
+
+```sh
+cargo run -p mini-ray-worker
+```
+
+Run a task example:
+
+```sh
+cargo run -p mini-ray-client --example add_one
+```
+
+Run an actor method sequencing example:
+
+```sh
+cargo run -p mini-ray-client --example counter_actor
+```
 
 ## Non-Goals for V1
 
-- Actors
 - Python bindings
 - Shared memory object storage
 - Durable recovery

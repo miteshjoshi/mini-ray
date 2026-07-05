@@ -13,17 +13,24 @@ async fn main() -> Result<()> {
         .create_actor::<Counter, u64>("Counter", vec![initial])
         .await?;
 
-    let first_delta = client.put(2u64).await?;
-    let first = client
-        .call_actor::<Counter, u64, u64>(counter, "increment", vec![first_delta])
-        .await?;
-    println!("{}", wait_for(&client, first).await?);
+    let add_two = client.put(2u64).await?;
+    let add_five = client.put(5u64).await?;
+    let add_three = client.put(3u64).await?;
 
-    let second_delta = client.put(5u64).await?;
-    let second = client
-        .call_actor::<Counter, u64, u64>(counter, "increment", vec![second_delta])
+    let first = client
+        .call_actor::<Counter, u64, u64>(counter, "increment", vec![add_two])
         .await?;
-    println!("{}", wait_for(&client, second).await?);
+    let second = client
+        .call_actor::<Counter, u64, u64>(counter, "increment", vec![add_five])
+        .await?;
+    let third = client
+        .call_actor::<Counter, u64, u64>(counter, "increment", vec![add_three])
+        .await?;
+
+    println!("start: 10");
+    println!("after increment(2): {}", wait_for(&client, first).await?);
+    println!("after increment(5): {}", wait_for(&client, second).await?);
+    println!("after increment(3): {}", wait_for(&client, third).await?);
     Ok(())
 }
 
