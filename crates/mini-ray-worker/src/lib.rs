@@ -114,8 +114,34 @@ impl Worker {
             .into_inner();
 
         let task_count = response.tasks.len();
+
+        let mut normal_tasks = Vec::new();
+        let mut first_error = None;
         for lease in response.tasks {
-            self.execute_remote_lease(lease).await?;
+            if lease.actor_id.is_empty() {
+                normal_tasks.push(tokio::spawn(execute_remote_stateless_lease(
+                    self.worker_id,
+                    self.registry.clone(),
+                    self.client.clone(),
+                    lease,
+                )));
+            } else if let Err(error) = self.execute_remote_actor_lease(lease).await {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        for task in normal_tasks {
+            let result = task
+                .await
+                .map_err(|error| MiniRayError::Transport(error.to_string()))
+                .and_then(|result| result);
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
         }
 
         Ok(task_count)
@@ -153,8 +179,8 @@ impl Worker {
         cleanup_result
     }
 
-    async fn execute_remote_lease(&mut self, lease: TaskLease) -> Result<()> {
-        let execution = match self.fetch_args_and_execute(&lease).await {
+    async fn execute_remote_actor_lease(&mut self, lease: TaskLease) -> Result<()> {
+        let execution = match self.fetch_actor_args_and_execute(&lease).await {
             Ok(execution) => execution,
             Err(error) => {
                 self.report_failure(&lease, error.to_string()).await?;
@@ -175,33 +201,17 @@ impl Worker {
         Ok(())
     }
 
-    async fn fetch_args_and_execute(&mut self, lease: &TaskLease) -> Result<TaskExecution> {
-        let mut args = Vec::with_capacity(lease.dependencies.len());
-        for object_id in &lease.dependencies {
-            let response = self
-                .client
-                .get_object(GetObjectRequest {
-                    object_id: object_id.clone(),
-                })
-                .await
-                .map_err(status_error)?
-                .into_inner();
-            args.push(response.data);
-        }
-
-        if lease.actor_id.is_empty() {
-            execute_lease(&self.registry, lease, args)
-        } else {
-            let constructor_args =
-                fetch_objects(&mut self.client, &lease.constructor_dependencies).await?;
-            execute_actor_lease(
-                &self.actor_registry,
-                &mut self.actor_instances,
-                lease,
-                constructor_args,
-                args,
-            )
-        }
+    async fn fetch_actor_args_and_execute(&mut self, lease: &TaskLease) -> Result<TaskExecution> {
+        let args = fetch_objects(&mut self.client, &lease.dependencies).await?;
+        let constructor_args =
+            fetch_objects(&mut self.client, &lease.constructor_dependencies).await?;
+        execute_actor_lease(
+            &self.actor_registry,
+            &mut self.actor_instances,
+            lease,
+            constructor_args,
+            args,
+        )
     }
 
     async fn report_failure(&mut self, lease: &TaskLease, error: String) -> Result<()> {
@@ -215,6 +225,62 @@ impl Worker {
             .map_err(status_error)?;
         Ok(())
     }
+}
+
+async fn execute_remote_stateless_lease(
+    worker_id: WorkerId,
+    registry: TaskRegistry,
+    mut client: HeadClient<Channel>,
+    lease: TaskLease,
+) -> Result<()> {
+    let execution = match fetch_stateless_args_and_execute(registry, &mut client, &lease).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            report_failure(&mut client, worker_id, &lease, error.to_string()).await?;
+            return Ok(());
+        }
+    };
+
+    client
+        .complete_task(CompleteTaskRequest {
+            worker_id: worker_id.to_string(),
+            task_id: execution.task_id,
+            output_id: execution.output_id,
+            data: execution.data,
+        })
+        .await
+        .map_err(status_error)?;
+
+    Ok(())
+}
+
+async fn fetch_stateless_args_and_execute(
+    registry: TaskRegistry,
+    client: &mut HeadClient<Channel>,
+    lease: &TaskLease,
+) -> Result<TaskExecution> {
+    let args = fetch_objects(client, &lease.dependencies).await?;
+    let lease = lease.clone();
+    tokio::task::spawn_blocking(move || execute_lease(&registry, &lease, args))
+        .await
+        .map_err(|error| MiniRayError::Transport(error.to_string()))?
+}
+
+async fn report_failure(
+    client: &mut HeadClient<Channel>,
+    worker_id: WorkerId,
+    lease: &TaskLease,
+    error: String,
+) -> Result<()> {
+    client
+        .fail_task(FailTaskRequest {
+            worker_id: worker_id.to_string(),
+            task_id: lease.task_id.clone(),
+            error,
+        })
+        .await
+        .map_err(status_error)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

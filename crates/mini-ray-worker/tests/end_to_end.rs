@@ -3,6 +3,10 @@ use mini_ray_core::Result;
 use mini_ray_runtime::{ActorRegistry, TaskRegistry};
 use mini_ray_worker::{Worker, WorkerConfig};
 use std::net::{SocketAddr, TcpListener};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -48,6 +52,42 @@ async fn task_runs_end_to_end() -> Result<()> {
 
     assert_eq!(worker.poll_and_execute_once().await?, 1);
     assert_eq!(client.get(output).await?, 42u64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn normal_tasks_execute_concurrently_across_worker_slots() -> Result<()> {
+    let address = start_head().await;
+    let client = connect_client(address).await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let mut registry = TaskRegistry::new();
+    registry.register_nullary("observe_concurrency", {
+        let active = active.clone();
+        let max_active = max_active.clone();
+        move || {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            active.fetch_sub(1, Ordering::SeqCst);
+            current as u64
+        }
+    })?;
+    let mut worker =
+        Worker::connect(WorkerConfig::new(format!("http://{address}"), 2), registry).await?;
+    worker.register().await?;
+
+    let first = client
+        .submit_refs::<u64>("observe_concurrency", vec![])
+        .await?;
+    let second = client
+        .submit_refs::<u64>("observe_concurrency", vec![])
+        .await?;
+
+    assert_eq!(worker.poll_and_execute_once().await?, 2);
+    assert!(max_active.load(Ordering::SeqCst) >= 2);
+    assert!(client.get(first).await? >= 1);
+    assert!(client.get(second).await? >= 1);
     Ok(())
 }
 
