@@ -20,6 +20,13 @@ use tokio::sync::Mutex;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCleanupReport {
+    pub tasks_removed: usize,
+    pub actor_task_metadata_removed: usize,
+    pub objects_removed: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct HeadService {
     object_store: InMemoryObjectStore,
@@ -82,6 +89,40 @@ impl HeadService {
         self.recover_actors_owned_by(&expired_workers, "worker heartbeat expired")
             .await;
         expiries.len()
+    }
+
+    pub async fn cleanup_terminal_metadata(
+        &self,
+        retain_terminal_tasks: usize,
+    ) -> MetadataCleanupReport {
+        let cleaned_tasks = self
+            .scheduler
+            .lock()
+            .await
+            .cleanup_terminal_tasks(retain_terminal_tasks);
+
+        let mut actor_task_metadata_removed = 0;
+        {
+            let mut actor_tasks = self.actor_tasks.lock().await;
+            for cleaned in &cleaned_tasks {
+                if actor_tasks.remove(&cleaned.task_id).is_some() {
+                    actor_task_metadata_removed += 1;
+                }
+            }
+        }
+
+        let mut objects_removed = 0;
+        for object_id in cleaned_tasks.iter().filter_map(|cleaned| cleaned.output_id) {
+            if self.object_store.delete(object_id).await {
+                objects_removed += 1;
+            }
+        }
+
+        MetadataCleanupReport {
+            tasks_removed: cleaned_tasks.len(),
+            actor_task_metadata_removed,
+            objects_removed,
+        }
     }
 
     async fn remove_worker(&self, worker_id: WorkerId, reason: String) {
@@ -1032,6 +1073,76 @@ mod tests {
             .into_inner();
         assert_eq!(second_poll.tasks.len(), 1);
         assert_eq!(second_poll.tasks[0].task_id, second.task_id);
+    }
+
+    #[tokio::test]
+    async fn cleanup_terminal_metadata_removes_old_actor_task_metadata_and_output_object() {
+        let service = HeadService::with_defaults();
+        let actor_id = ActorId::new();
+        let worker_id = WorkerId::new();
+        let output_id = ObjectId::new();
+
+        service
+            .register_worker(Request::new(RegisterWorkerRequest {
+                worker_id: worker_id.to_string(),
+                slots: 1,
+            }))
+            .await
+            .unwrap();
+        service
+            .create_actor(Request::new(CreateActorRequest {
+                actor_type: "Counter".to_string(),
+                constructor_dependencies: vec![],
+                actor_id: actor_id.to_string(),
+                max_restarts: 0,
+            }))
+            .await
+            .unwrap();
+        let submitted = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: output_id.to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker_id.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap();
+        service
+            .complete_task(Request::new(CompleteTaskRequest {
+                worker_id: worker_id.to_string(),
+                task_id: submitted.task_id.clone(),
+                output_id: output_id.to_string(),
+                data: encode(&42u64).unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        let task_id = TaskId::from_string(&submitted.task_id).unwrap();
+        assert_eq!(service.actor_tasks.lock().await.len(), 1);
+        assert!(service.object_store().contains(output_id).await);
+
+        let report = service.cleanup_terminal_metadata(0).await;
+
+        assert_eq!(
+            report,
+            MetadataCleanupReport {
+                tasks_removed: 1,
+                actor_task_metadata_removed: 1,
+                objects_removed: 1,
+            }
+        );
+        assert_eq!(service.actor_tasks.lock().await.len(), 0);
+        assert_eq!(service.scheduler.lock().await.task_state(task_id), None);
+        assert!(!service.object_store().contains(output_id).await);
     }
 
     #[tokio::test]

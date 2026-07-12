@@ -1,5 +1,5 @@
 use mini_ray_core::{ActorId, MiniRayError, ObjectId, Result, TaskId, TaskSpec, WorkerId};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,10 +19,22 @@ pub struct TaskRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRecord {
+    pub available: bool,
+    pub ref_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerExpiry {
     pub worker_id: WorkerId,
     pub retried_tasks: Vec<TaskId>,
     pub failed_tasks: Vec<TaskId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanedTask {
+    pub task_id: TaskId,
+    pub output_id: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,8 +47,9 @@ struct WorkerRecord {
 #[derive(Debug)]
 pub struct Scheduler {
     tasks: HashMap<TaskId, TaskRecord>,
+    terminal_tasks: VecDeque<TaskId>,
     ready: VecDeque<TaskId>,
-    known_objects: HashSet<ObjectId>,
+    objects: HashMap<ObjectId, ObjectRecord>,
     workers: HashMap<WorkerId, WorkerRecord>,
     heartbeat_timeout: Duration,
 }
@@ -45,8 +58,9 @@ impl Scheduler {
     pub fn new(heartbeat_timeout: Duration) -> Self {
         Self {
             tasks: HashMap::new(),
+            terminal_tasks: VecDeque::new(),
             ready: VecDeque::new(),
-            known_objects: HashSet::new(),
+            objects: HashMap::new(),
             workers: HashMap::new(),
             heartbeat_timeout,
         }
@@ -83,6 +97,10 @@ impl Scheduler {
             spec.target_worker = None;
         }
 
+        for dependency in &spec.dependencies {
+            self.retain_object(*dependency);
+        }
+
         let state = if self.dependencies_ready(&spec) {
             self.ready.push_back(spec.task_id);
             TaskState::Ready
@@ -95,7 +113,13 @@ impl Scheduler {
     }
 
     pub fn object_available(&mut self, object_id: ObjectId) {
-        self.known_objects.insert(object_id);
+        self.objects
+            .entry(object_id)
+            .and_modify(|object| object.available = true)
+            .or_insert(ObjectRecord {
+                available: true,
+                ref_count: 0,
+            });
         let newly_ready: Vec<TaskId> = self
             .tasks
             .iter()
@@ -173,6 +197,7 @@ impl Scheduler {
             record.state = TaskState::Finished;
         }
         self.object_available(output_id);
+        self.record_terminal_task(task_id);
         Ok(())
     }
 
@@ -193,6 +218,7 @@ impl Scheduler {
             self.ready.push_back(task_id);
         } else {
             record.state = TaskState::Failed(error);
+            self.record_terminal_task(task_id);
         }
         Ok(())
     }
@@ -212,6 +238,7 @@ impl Scheduler {
                     if let Some(record) = self.tasks.get_mut(task_id) {
                         record.state = TaskState::Failed(error.clone());
                         failed.push(*task_id);
+                        self.record_terminal_task(*task_id);
                     }
                 }
                 TaskState::Leased(worker_id) | TaskState::Running(worker_id) => {
@@ -219,6 +246,7 @@ impl Scheduler {
                     if let Some(record) = self.tasks.get_mut(task_id) {
                         record.state = TaskState::Failed(error.clone());
                         failed.push(*task_id);
+                        self.record_terminal_task(*task_id);
                     }
                 }
             }
@@ -243,6 +271,66 @@ impl Scheduler {
                 None
             }
         })
+    }
+
+    pub fn forget_object(&mut self, object_id: ObjectId) {
+        self.objects.remove(&object_id);
+    }
+
+    pub fn retain_object(&mut self, object_id: ObjectId) {
+        self.objects
+            .entry(object_id)
+            .and_modify(|object| object.ref_count += 1)
+            .or_insert(ObjectRecord {
+                available: false,
+                ref_count: 1,
+            });
+    }
+
+    pub fn release_object(&mut self, object_id: ObjectId) {
+        if let Some(object) = self.objects.get_mut(&object_id) {
+            object.ref_count = object.ref_count.saturating_sub(1);
+        }
+    }
+
+    pub fn object_record(&self, object_id: ObjectId) -> Option<ObjectRecord> {
+        self.objects.get(&object_id).cloned()
+    }
+
+    pub fn cleanup_terminal_tasks(&mut self, retain_terminal_tasks: usize) -> Vec<CleanedTask> {
+        let mut cleaned = Vec::new();
+        let mut checked = 0;
+        let terminal_count = self.terminal_tasks.len();
+
+        while self.terminal_tasks.len() > retain_terminal_tasks && checked < terminal_count {
+            checked += 1;
+            let Some(task_id) = self.terminal_tasks.pop_front() else {
+                break;
+            };
+            let Some(record) = self.tasks.get(&task_id) else {
+                continue;
+            };
+            if !matches!(record.state, TaskState::Finished | TaskState::Failed(_)) {
+                continue;
+            }
+
+            let output_id = record.spec.output_id;
+            let is_finished = matches!(record.state, TaskState::Finished);
+            if is_finished && self.object_ref_count(output_id) > 0 {
+                self.terminal_tasks.push_back(task_id);
+                continue;
+            }
+            self.tasks.remove(&task_id);
+            if is_finished {
+                self.forget_object(output_id);
+            }
+            cleaned.push(CleanedTask {
+                task_id,
+                output_id: is_finished.then_some(output_id),
+            });
+        }
+
+        cleaned
     }
 
     pub fn force_worker_last_heartbeat(&mut self, worker_id: WorkerId, last_heartbeat: Instant) {
@@ -305,6 +393,7 @@ impl Scheduler {
                     } else {
                         record.state = TaskState::Failed(failure_reason.clone());
                         expiry.failed_tasks.push(task_id);
+                        self.record_terminal_task(task_id);
                     }
                 }
             }
@@ -314,9 +403,37 @@ impl Scheduler {
     }
 
     fn dependencies_ready(&self, spec: &TaskSpec) -> bool {
-        spec.dependencies
-            .iter()
-            .all(|object_id| self.known_objects.contains(object_id))
+        spec.dependencies.iter().all(|object_id| {
+            self.objects
+                .get(object_id)
+                .is_some_and(|object| object.available)
+        })
+    }
+
+    fn record_terminal_task(&mut self, task_id: TaskId) {
+        self.terminal_tasks.push_back(task_id);
+        self.release_task_dependencies(task_id);
+    }
+
+    fn release_task_dependencies(&mut self, task_id: TaskId) {
+        let Some(dependencies) = self
+            .tasks
+            .get(&task_id)
+            .map(|record| record.spec.dependencies.clone())
+        else {
+            return;
+        };
+
+        for dependency in dependencies {
+            self.release_object(dependency);
+        }
+    }
+
+    fn object_ref_count(&self, object_id: ObjectId) -> usize {
+        self.objects
+            .get(&object_id)
+            .map(|object| object.ref_count)
+            .unwrap_or(0)
     }
 
     fn steal_from_busiest(&mut self, thief: WorkerId) -> Option<TaskId> {
@@ -437,6 +554,7 @@ fn steal_capacity(requested: usize, held: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn dependency_resolution_moves_task_to_ready() {
@@ -819,6 +937,103 @@ mod tests {
 
         assert_eq!(scheduler.task_state(producer_id), Some(TaskState::Finished));
         assert_eq!(scheduler.task_state(consumer_id), Some(TaskState::Ready));
+    }
+
+    #[test]
+    fn cleanup_terminal_tasks_retains_newest_terminal_records() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        let first_output = ObjectId::new();
+        let second_output = ObjectId::new();
+        let first = TaskSpec::new("first", vec![], first_output);
+        let first_id = first.task_id;
+        let second = TaskSpec::new("second", vec![], second_output);
+        let second_id = second.task_id;
+        scheduler.submit(first).unwrap();
+        scheduler.submit(second).unwrap();
+
+        scheduler.lease_tasks(worker, 1).unwrap();
+        scheduler.complete(worker, first_id, first_output).unwrap();
+        scheduler.lease_tasks(worker, 1).unwrap();
+        scheduler
+            .complete(worker, second_id, second_output)
+            .unwrap();
+
+        let cleaned = scheduler.cleanup_terminal_tasks(1);
+
+        assert_eq!(
+            cleaned,
+            vec![CleanedTask {
+                task_id: first_id,
+                output_id: Some(first_output),
+            }]
+        );
+        assert_eq!(scheduler.task_state(first_id), None);
+        assert_eq!(scheduler.task_state(second_id), Some(TaskState::Finished));
+        assert_eq!(scheduler.object_record(first_output), None);
+        assert_eq!(
+            scheduler.object_record(second_output),
+            Some(ObjectRecord {
+                available: true,
+                ref_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn cleanup_terminal_tasks_waits_for_active_dependents_before_removing_output() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        let dependency = ObjectId::new();
+        let producer = TaskSpec::new("producer", vec![], dependency);
+        let producer_id = producer.task_id;
+        let consumer_output = ObjectId::new();
+        let consumer = TaskSpec::new("consumer", vec![dependency], consumer_output);
+        let consumer_id = consumer.task_id;
+        scheduler.submit(producer).unwrap();
+        scheduler.submit(consumer).unwrap();
+
+        scheduler.lease_tasks(worker, 1).unwrap();
+        scheduler.complete(worker, producer_id, dependency).unwrap();
+
+        let cleaned = scheduler.cleanup_terminal_tasks(0);
+
+        assert!(cleaned.is_empty());
+        assert_eq!(scheduler.task_state(producer_id), Some(TaskState::Finished));
+        assert_eq!(scheduler.task_state(consumer_id), Some(TaskState::Ready));
+        assert_eq!(
+            scheduler.object_record(dependency),
+            Some(ObjectRecord {
+                available: true,
+                ref_count: 1,
+            })
+        );
+
+        scheduler.lease_tasks(worker, 1).unwrap();
+        scheduler
+            .complete(worker, consumer_id, consumer_output)
+            .unwrap();
+        let cleaned = scheduler.cleanup_terminal_tasks(0);
+
+        assert_eq!(
+            cleaned,
+            vec![
+                CleanedTask {
+                    task_id: producer_id,
+                    output_id: Some(dependency),
+                },
+                CleanedTask {
+                    task_id: consumer_id,
+                    output_id: Some(consumer_output),
+                },
+            ]
+        );
+        assert_eq!(scheduler.task_state(producer_id), None);
+        assert_eq!(scheduler.task_state(consumer_id), None);
+        assert_eq!(scheduler.object_record(dependency), None);
+        assert_eq!(scheduler.object_record(consumer_output), None);
     }
 
     #[test]

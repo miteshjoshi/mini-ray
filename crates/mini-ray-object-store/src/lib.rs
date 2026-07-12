@@ -49,6 +49,14 @@ impl InMemoryObjectStore {
     pub async fn contains(&self, id: ObjectId) -> bool {
         self.objects.read().await.contains_key(&id)
     }
+
+    pub async fn delete(&self, id: ObjectId) -> bool {
+        self.objects.write().await.remove(&id).is_some()
+    }
+
+    pub async fn len(&self) -> usize {
+        self.objects.read().await.len()
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +94,22 @@ mod tests {
         store.put_bytes(id, vec![9]).await;
 
         assert!(store.contains(id).await);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_object() {
+        let store = InMemoryObjectStore::new();
+        let id = ObjectId::new();
+        store.put_bytes(id, vec![9]).await;
+
+        assert_eq!(store.len().await, 1);
+        assert!(store.delete(id).await);
+        assert_eq!(store.len().await, 0);
+        assert!(!store.delete(id).await);
+        assert!(matches!(
+            store.get_bytes(id).await,
+            Err(MiniRayError::MissingObject(_))
+        ));
     }
 
     #[tokio::test]

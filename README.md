@@ -30,7 +30,11 @@ let result: u64 = cluster.get(output).await?;
 
 mini-ray can run simple remote tasks and single-threaded actors end to end. Actor method calls are sequenced per actor: later methods wait behind lower-sequence methods until those methods finish or fail terminally, while different actors and normal tasks can schedule independently.
 
-The object store is still centralized and in-memory, worker execution is intentionally small, and the project remains an educational MVP rather than a production runtime.
+Workers execute stateless task leases concurrently up to their slot capacity. Actor method leases still execute through the worker's actor instance store, preserving single-threaded actor state.
+
+The scheduler tracks object availability and internal task dependency references. Completed task outputs are eligible for cleanup only after no active task still references them. The object store is still centralized and in-memory, and the project remains an educational MVP rather than a production runtime.
+
+See [docs/architecture.md](docs/architecture.md) for task, actor, worker, and metadata cleanup behavior.
 
 ## Running Locally
 
@@ -63,5 +67,6 @@ cargo run -p mini-ray-client --example counter_actor
 - Python bindings
 - Shared memory object storage
 - Durable recovery
+- Client-side `ObjectRef` drop tracking
 - Autoscaling
 - Dashboard UI
