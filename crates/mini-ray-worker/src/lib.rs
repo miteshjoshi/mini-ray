@@ -6,6 +6,8 @@ use mini_ray_proto::miniray::v1::{
     HeartbeatRequest, PollTaskRequest, RegisterWorkerRequest, TaskLease, UnregisterWorkerRequest,
 };
 use mini_ray_runtime::{ActorInstanceStore, ActorRegistry, TaskRegistry};
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 use tonic::transport::Channel;
 
@@ -16,6 +18,7 @@ pub struct WorkerConfig {
     pub poll_capacity: u32,
     pub poll_interval: Duration,
     pub heartbeat_interval: Duration,
+    pub pressure_path: PathBuf,
 }
 
 impl WorkerConfig {
@@ -27,8 +30,41 @@ impl WorkerConfig {
             poll_capacity: slots,
             poll_interval: Duration::from_millis(100),
             heartbeat_interval: Duration::from_secs(1),
+            pressure_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResourcePressure {
+    #[default]
+    Unknown,
+    Low,
+    Moderate,
+    High,
+    Critical,
+}
+
+impl ResourcePressure {
+    fn as_wire(self) -> u32 {
+        match self {
+            Self::Unknown => 0,
+            Self::Low => 1,
+            Self::Moderate => 2,
+            Self::High => 3,
+            Self::Critical => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResourceSample {
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub memory_pressure: ResourcePressure,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub disk_pressure: ResourcePressure,
 }
 
 #[derive(Debug)]
@@ -81,11 +117,18 @@ impl Worker {
     }
 
     pub async fn heartbeat(&mut self) -> Result<()> {
+        let resources = sample_resources(&self.config.pressure_path);
         self.client
             .heartbeat(HeartbeatRequest {
                 worker_id: self.worker_id.to_string(),
                 running: 0,
                 queued: 0,
+                memory_used_bytes: resources.memory_used_bytes,
+                memory_total_bytes: resources.memory_total_bytes,
+                memory_pressure: resources.memory_pressure.as_wire(),
+                disk_used_bytes: resources.disk_used_bytes,
+                disk_total_bytes: resources.disk_total_bytes,
+                disk_pressure: resources.disk_pressure.as_wire(),
             })
             .await
             .map_err(status_error)?;
@@ -384,6 +427,147 @@ fn status_error(error: tonic::Status) -> MiniRayError {
     MiniRayError::Transport(error.to_string())
 }
 
+pub fn sample_resources(path: impl Into<PathBuf>) -> ResourceSample {
+    let memory = sample_memory();
+    let disk = sample_disk(path.into());
+    let (memory_used_bytes, memory_total_bytes, memory_pressure) =
+        resource_fields_from_usage(memory);
+    let (disk_used_bytes, disk_total_bytes, disk_pressure) = resource_fields_from_usage(disk);
+
+    ResourceSample {
+        memory_used_bytes,
+        memory_total_bytes,
+        memory_pressure,
+        disk_used_bytes,
+        disk_total_bytes,
+        disk_pressure,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageSample {
+    used_bytes: u64,
+    total_bytes: u64,
+}
+
+fn resource_fields_from_usage(sample: Option<UsageSample>) -> (u64, u64, ResourcePressure) {
+    sample
+        .map(|sample| {
+            (
+                sample.used_bytes,
+                sample.total_bytes,
+                pressure_from_usage(sample.used_bytes, sample.total_bytes),
+            )
+        })
+        .unwrap_or((0, 0, ResourcePressure::Unknown))
+}
+
+fn pressure_from_usage(used_bytes: u64, total_bytes: u64) -> ResourcePressure {
+    if total_bytes == 0 {
+        return ResourcePressure::Unknown;
+    }
+
+    let used_percent = (used_bytes as u128).saturating_mul(100) / total_bytes as u128;
+    if used_percent >= 95 {
+        ResourcePressure::Critical
+    } else if used_percent >= 85 {
+        ResourcePressure::High
+    } else if used_percent >= 70 {
+        ResourcePressure::Moderate
+    } else {
+        ResourcePressure::Low
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sample_memory() -> Option<UsageSample> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let total_kib = parse_meminfo_kib(&meminfo, "MemTotal:")?;
+    let available_kib = parse_meminfo_kib(&meminfo, "MemAvailable:")?;
+    let used_kib = total_kib.saturating_sub(available_kib);
+    Some(UsageSample {
+        used_bytes: used_kib.saturating_mul(1024),
+        total_bytes: total_kib.saturating_mul(1024),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_kib(meminfo: &str, key: &str) -> Option<u64> {
+    meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix(key)?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sample_memory() -> Option<UsageSample> {
+    let total_bytes: u64 = command_stdout(Command::new("sysctl").args(["-n", "hw.memsize"]))?
+        .trim()
+        .parse()
+        .ok()?;
+    let vm_stat = command_stdout(&mut Command::new("vm_stat"))?;
+    let page_size = parse_vm_stat_page_size(&vm_stat)?;
+    let free_pages = parse_vm_stat_pages(&vm_stat, "Pages free:").unwrap_or(0);
+    let inactive_pages = parse_vm_stat_pages(&vm_stat, "Pages inactive:").unwrap_or(0);
+    let speculative_pages = parse_vm_stat_pages(&vm_stat, "Pages speculative:").unwrap_or(0);
+    let available_bytes = free_pages
+        .saturating_add(inactive_pages)
+        .saturating_add(speculative_pages)
+        .saturating_mul(page_size);
+    Some(UsageSample {
+        used_bytes: total_bytes.saturating_sub(available_bytes),
+        total_bytes,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_vm_stat_page_size(vm_stat: &str) -> Option<u64> {
+    let first = vm_stat.lines().next()?;
+    let digits: String = first.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_vm_stat_pages(vm_stat: &str, key: &str) -> Option<u64> {
+    vm_stat.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix(key)?;
+        rest.trim()
+            .trim_end_matches('.')
+            .replace(',', "")
+            .parse()
+            .ok()
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn sample_memory() -> Option<UsageSample> {
+    None
+}
+
+fn sample_disk(path: PathBuf) -> Option<UsageSample> {
+    let output = command_stdout(Command::new("df").arg("-Pk").arg(path))?;
+    parse_df_output(&output)
+}
+
+fn parse_df_output(output: &str) -> Option<UsageSample> {
+    let line = output.lines().nth(1)?;
+    let columns: Vec<&str> = line.split_whitespace().collect();
+    let total_kib: u64 = columns.get(1)?.parse().ok()?;
+    let used_kib: u64 = columns.get(2)?.parse().ok()?;
+    Some(UsageSample {
+        used_bytes: used_kib.saturating_mul(1024),
+        total_bytes: total_kib.saturating_mul(1024),
+    })
+}
+
+fn command_stdout(command: &mut Command) -> Option<String> {
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +631,30 @@ mod tests {
         let err = execute_lease(&registry, &lease, vec![]).unwrap_err();
 
         assert!(matches!(err, MiniRayError::TaskFailed(_)));
+    }
+
+    #[test]
+    fn pressure_from_usage_uses_expected_thresholds() {
+        assert_eq!(pressure_from_usage(0, 0), ResourcePressure::Unknown);
+        assert_eq!(pressure_from_usage(69, 100), ResourcePressure::Low);
+        assert_eq!(pressure_from_usage(70, 100), ResourcePressure::Moderate);
+        assert_eq!(pressure_from_usage(85, 100), ResourcePressure::High);
+        assert_eq!(pressure_from_usage(95, 100), ResourcePressure::Critical);
+        assert_eq!(
+            pressure_from_usage(u64::MAX, u64::MAX),
+            ResourcePressure::Critical
+        );
+    }
+
+    #[test]
+    fn parse_df_output_reads_total_and_used_kib() {
+        let sample = parse_df_output(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1 100 85 15 85% /\n",
+        )
+        .unwrap();
+
+        assert_eq!(sample.total_bytes, 100 * 1024);
+        assert_eq!(sample.used_bytes, 85 * 1024);
     }
 
     #[test]

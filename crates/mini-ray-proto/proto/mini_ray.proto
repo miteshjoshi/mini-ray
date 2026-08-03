@@ -127,6 +127,12 @@ message HeartbeatRequest {
   string worker_id = 1;
   uint32 running = 2;
   uint32 queued = 3;
+  uint64 memory_used_bytes = 4;
+  uint64 memory_total_bytes = 5;
+  uint32 memory_pressure = 6;
+  uint64 disk_used_bytes = 7;
+  uint64 disk_total_bytes = 8;
+  uint32 disk_pressure = 9;
 }
 
 message HeartbeatResponse {}

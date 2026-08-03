@@ -33,6 +33,36 @@ Stateless task leases execute concurrently:
 
 Actor method leases are intentionally not spawned onto the stateless path. They execute through the worker's `ActorInstanceStore`, preserving a single mutable actor instance per actor id on that worker.
 
+## Memory and Disk Pressure
+
+Workers include best-effort memory and disk usage in heartbeats:
+
+- memory used bytes
+- memory total bytes
+- memory pressure
+- disk used bytes
+- disk total bytes
+- disk pressure
+
+Pressure levels are `Unknown`, `Low`, `Moderate`, `High`, and `Critical`. The worker derives pressure from used/total ratios:
+
+```text
+< 70%  -> Low
+>= 70% -> Moderate
+>= 85% -> High
+>= 95% -> Critical
+```
+
+The scheduler stores the latest resource usage for each worker. Workers reporting `High` or `Critical` memory or disk pressure do not receive new leases, even if they still have free execution slots. This keeps CPU slot availability separate from memory/disk safety.
+
+Sampling is intentionally lightweight and best effort:
+
+- Linux memory is read from `/proc/meminfo`.
+- macOS memory is read from `sysctl` and `vm_stat`.
+- Disk capacity is read with `df -Pk` for the worker's configured pressure path.
+
+If sampling fails, the worker reports `Unknown`, which does not block leases.
+
 ## Actor Execution
 
 Actors are single-threaded and ordered.
@@ -81,5 +111,5 @@ Failed task records are retained until cleanup so `get_object` can report produc
 - Client-held `ObjectRef`s are not reference-counted.
 - There is no object spilling, lineage reconstruction, or durable recovery.
 - Cleanup is explicit; there is no automatic background retention policy yet.
-- Worker heartbeat payloads do not yet report real running and queued counts.
+- Worker heartbeat payloads report memory and disk pressure, but `running` and `queued` counts are still placeholders.
 - Actor restart behavior exists but is still intentionally simple.

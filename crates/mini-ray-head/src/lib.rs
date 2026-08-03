@@ -11,7 +11,7 @@ use mini_ray_proto::miniray::v1::{
     SubmitTaskRequest, SubmitTaskResponse, TaskLease, UnregisterWorkerRequest,
     UnregisterWorkerResponse,
 };
-use mini_ray_scheduler::Scheduler;
+use mini_ray_scheduler::{ResourcePressure, Scheduler, WorkerResourceUsage};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -479,8 +479,19 @@ impl Head for HeadService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> std::result::Result<Response<HeartbeatResponse>, Status> {
-        let worker_id = parse_worker_id(&request.into_inner().worker_id)?;
-        self.scheduler.lock().await.heartbeat(worker_id);
+        let request = request.into_inner();
+        let worker_id = parse_worker_id(&request.worker_id)?;
+        self.scheduler.lock().await.heartbeat_with_resources(
+            worker_id,
+            WorkerResourceUsage {
+                memory_used_bytes: request.memory_used_bytes,
+                memory_total_bytes: request.memory_total_bytes,
+                memory_pressure: ResourcePressure::from_wire(request.memory_pressure),
+                disk_used_bytes: request.disk_used_bytes,
+                disk_total_bytes: request.disk_total_bytes,
+                disk_pressure: ResourcePressure::from_wire(request.disk_pressure),
+            },
+        );
 
         Ok(Response::new(HeartbeatResponse {}))
     }
@@ -633,6 +644,54 @@ mod tests {
         assert_eq!(polled.tasks[0].task_id, submitted.task_id);
         assert_eq!(polled.tasks[0].function_id, "add_one");
         assert_eq!(polled.tasks[0].output_id, output_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_memory_pressure_blocks_new_leases() {
+        let service = HeadService::with_defaults();
+        let worker_id = WorkerId::new();
+
+        service
+            .register_worker(Request::new(RegisterWorkerRequest {
+                worker_id: worker_id.to_string(),
+                slots: 1,
+            }))
+            .await
+            .unwrap();
+        service
+            .heartbeat(Request::new(HeartbeatRequest {
+                worker_id: worker_id.to_string(),
+                running: 0,
+                queued: 0,
+                memory_used_bytes: 95,
+                memory_total_bytes: 100,
+                memory_pressure: ResourcePressure::High.as_wire(),
+                disk_used_bytes: 10,
+                disk_total_bytes: 100,
+                disk_pressure: ResourcePressure::Low.as_wire(),
+            }))
+            .await
+            .unwrap();
+        service
+            .submit_task(Request::new(SubmitTaskRequest {
+                function_id: "add_one".to_string(),
+                dependencies: vec![],
+                output_id: ObjectId::new().to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap();
+
+        let polled = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker_id.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(polled.tasks.is_empty());
     }
 
     #[tokio::test]

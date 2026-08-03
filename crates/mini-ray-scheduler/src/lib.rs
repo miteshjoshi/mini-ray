@@ -37,11 +37,64 @@ pub struct CleanedTask {
     pub output_id: Option<ObjectId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResourcePressure {
+    #[default]
+    Unknown,
+    Low,
+    Moderate,
+    High,
+    Critical,
+}
+
+impl ResourcePressure {
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::Low,
+            2 => Self::Moderate,
+            3 => Self::High,
+            4 => Self::Critical,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_wire(self) -> u32 {
+        match self {
+            Self::Unknown => 0,
+            Self::Low => 1,
+            Self::Moderate => 2,
+            Self::High => 3,
+            Self::Critical => 4,
+        }
+    }
+
+    fn blocks_new_leases(self) -> bool {
+        matches!(self, Self::High | Self::Critical)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerResourceUsage {
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub memory_pressure: ResourcePressure,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub disk_pressure: ResourcePressure,
+}
+
+impl WorkerResourceUsage {
+    fn blocks_new_leases(&self) -> bool {
+        self.memory_pressure.blocks_new_leases() || self.disk_pressure.blocks_new_leases()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorkerRecord {
     slots: usize,
     last_heartbeat: Instant,
     leased: VecDeque<TaskId>,
+    resource_usage: WorkerResourceUsage,
 }
 
 #[derive(Debug)]
@@ -73,6 +126,7 @@ impl Scheduler {
                 slots: slots.max(1),
                 last_heartbeat: Instant::now(),
                 leased: VecDeque::new(),
+                resource_usage: WorkerResourceUsage::default(),
             },
         );
     }
@@ -81,6 +135,23 @@ impl Scheduler {
         if let Some(worker) = self.workers.get_mut(&worker_id) {
             worker.last_heartbeat = Instant::now();
         }
+    }
+
+    pub fn heartbeat_with_resources(
+        &mut self,
+        worker_id: WorkerId,
+        resource_usage: WorkerResourceUsage,
+    ) {
+        if let Some(worker) = self.workers.get_mut(&worker_id) {
+            worker.last_heartbeat = Instant::now();
+            worker.resource_usage = resource_usage;
+        }
+    }
+
+    pub fn worker_resource_usage(&self, worker_id: WorkerId) -> Option<WorkerResourceUsage> {
+        self.workers
+            .get(&worker_id)
+            .map(|worker| worker.resource_usage.clone())
     }
 
     pub fn submit(&mut self, mut spec: TaskSpec) -> Result<()> {
@@ -145,6 +216,9 @@ impl Scheduler {
             .workers
             .get(&worker_id)
             .ok_or_else(|| MiniRayError::Scheduler(format!("unknown worker {worker_id}")))?;
+        if worker.resource_usage.blocks_new_leases() {
+            return Ok(Vec::new());
+        }
         let available = worker
             .slots
             .saturating_sub(worker.leased.len())
@@ -437,6 +511,14 @@ impl Scheduler {
     }
 
     fn steal_from_busiest(&mut self, thief: WorkerId) -> Option<TaskId> {
+        if self
+            .workers
+            .get(&thief)
+            .is_some_and(|worker| worker.resource_usage.blocks_new_leases())
+        {
+            return None;
+        }
+
         let victim_id = self
             .workers
             .iter()
@@ -598,6 +680,73 @@ mod tests {
 
         assert_eq!(scheduler.lease_tasks(worker_a, 1).unwrap().len(), 1);
         assert_eq!(scheduler.lease_tasks(worker_b, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn worker_under_memory_pressure_does_not_receive_new_leases() {
+        let mut scheduler = Scheduler::default();
+        let pressured = WorkerId::new();
+        scheduler.register_worker(pressured, 1);
+        scheduler.heartbeat_with_resources(
+            pressured,
+            WorkerResourceUsage {
+                memory_pressure: ResourcePressure::High,
+                ..WorkerResourceUsage::default()
+            },
+        );
+        scheduler
+            .submit(TaskSpec::new("noop", vec![], ObjectId::new()))
+            .unwrap();
+
+        assert!(scheduler.lease_tasks(pressured, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_heartbeat_preserves_last_resource_usage() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+        scheduler.heartbeat_with_resources(
+            worker,
+            WorkerResourceUsage {
+                memory_pressure: ResourcePressure::High,
+                ..WorkerResourceUsage::default()
+            },
+        );
+
+        scheduler.heartbeat(worker);
+
+        assert_eq!(
+            scheduler
+                .worker_resource_usage(worker)
+                .unwrap()
+                .memory_pressure,
+            ResourcePressure::High
+        );
+    }
+
+    #[test]
+    fn worker_under_disk_pressure_does_not_steal_leases() {
+        let mut scheduler = Scheduler::default();
+        let busy = WorkerId::new();
+        let pressured = WorkerId::new();
+        scheduler.register_worker(busy, 3);
+        scheduler.register_worker(pressured, 1);
+        scheduler.heartbeat_with_resources(
+            pressured,
+            WorkerResourceUsage {
+                disk_pressure: ResourcePressure::Critical,
+                ..WorkerResourceUsage::default()
+            },
+        );
+        for _ in 0..2 {
+            scheduler
+                .submit(TaskSpec::new("noop", vec![], ObjectId::new()))
+                .unwrap();
+        }
+        scheduler.lease_tasks(busy, 2).unwrap();
+
+        assert!(scheduler.lease_tasks(pressured, 1).unwrap().is_empty());
     }
 
     #[test]
