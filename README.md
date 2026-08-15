@@ -32,7 +32,7 @@ mini-ray can run simple remote tasks and single-threaded actors end to end. Acto
 
 Workers execute stateless task leases concurrently up to their slot capacity. Actor method leases still execute through the worker's actor instance store, preserving single-threaded actor state.
 
-Workers report best-effort memory and disk pressure in heartbeats. The scheduler avoids leasing new work to workers reporting high or critical pressure.
+Workers report active and locally queued execution counts plus best-effort memory and disk pressure in heartbeats. The scheduler avoids leasing new work to workers reporting high or critical pressure.
 
 The scheduler tracks object availability and internal task dependency references. Completed task outputs are eligible for cleanup only after no active task still references them. The object store is still centralized and in-memory, and the project remains an educational MVP rather than a production runtime.
 

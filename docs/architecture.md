@@ -33,10 +33,14 @@ Stateless task leases execute concurrently:
 
 Actor method leases are intentionally not spawned onto the stateless path. They execute through the worker's `ActorInstanceStore`, preserving a single mutable actor instance per actor id on that worker.
 
+Workers track in-flight stateless tasks and actor methods with a shared counter. They also track leases accepted from the head but not yet started as a local `queued` count. The worker run loop sends heartbeats from a separate async task, so long-running task execution does not prevent the head from seeing current load counts.
+
 ## Memory and Disk Pressure
 
-Workers include best-effort memory and disk usage in heartbeats:
+Workers include execution load and best-effort memory and disk usage in heartbeats:
 
+- running task count
+- queued task count
 - memory used bytes
 - memory total bytes
 - memory pressure
@@ -111,5 +115,5 @@ Failed task records are retained until cleanup so `get_object` can report produc
 - Client-held `ObjectRef`s are not reference-counted.
 - There is no object spilling, lineage reconstruction, or durable recovery.
 - Cleanup is explicit; there is no automatic background retention policy yet.
-- Worker heartbeat payloads report memory and disk pressure, but `running` and `queued` counts are still placeholders.
+- Worker heartbeat payloads report real `running` and local `queued` counts.
 - Actor restart behavior exists but is still intentionally simple.

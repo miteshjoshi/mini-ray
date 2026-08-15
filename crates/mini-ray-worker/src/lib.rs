@@ -8,6 +8,10 @@ use mini_ray_proto::miniray::v1::{
 use mini_ray_runtime::{ActorInstanceStore, ActorRegistry, TaskRegistry};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tonic::transport::Channel;
 
@@ -75,6 +79,8 @@ pub struct Worker {
     actor_registry: ActorRegistry,
     actor_instances: ActorInstanceStore,
     client: HeadClient<Channel>,
+    running_tasks: Arc<AtomicU32>,
+    queued_tasks: Arc<AtomicU32>,
 }
 
 impl Worker {
@@ -97,6 +103,8 @@ impl Worker {
             actor_registry,
             actor_instances: ActorInstanceStore::new(),
             client,
+            running_tasks: Arc::new(AtomicU32::new(0)),
+            queued_tasks: Arc::new(AtomicU32::new(0)),
         };
         Ok(worker)
     }
@@ -117,19 +125,13 @@ impl Worker {
     }
 
     pub async fn heartbeat(&mut self) -> Result<()> {
-        let resources = sample_resources(&self.config.pressure_path);
         self.client
-            .heartbeat(HeartbeatRequest {
-                worker_id: self.worker_id.to_string(),
-                running: 0,
-                queued: 0,
-                memory_used_bytes: resources.memory_used_bytes,
-                memory_total_bytes: resources.memory_total_bytes,
-                memory_pressure: resources.memory_pressure.as_wire(),
-                disk_used_bytes: resources.disk_used_bytes,
-                disk_total_bytes: resources.disk_total_bytes,
-                disk_pressure: resources.disk_pressure.as_wire(),
-            })
+            .heartbeat(build_heartbeat_request(
+                self.worker_id,
+                &self.config.pressure_path,
+                &self.running_tasks,
+                &self.queued_tasks,
+            ))
             .await
             .map_err(status_error)?;
         Ok(())
@@ -157,19 +159,28 @@ impl Worker {
             .into_inner();
 
         let task_count = response.tasks.len();
+        self.queued_tasks
+            .store(saturating_u32(task_count), Ordering::SeqCst);
 
         let mut normal_tasks = Vec::new();
         let mut first_error = None;
         for lease in response.tasks {
             if lease.actor_id.is_empty() {
+                self.queued_tasks.fetch_sub(1, Ordering::SeqCst);
+                let running_tasks = self.running_tasks.clone();
                 normal_tasks.push(tokio::spawn(execute_remote_stateless_lease(
                     self.worker_id,
                     self.registry.clone(),
                     self.client.clone(),
                     lease,
+                    running_tasks,
                 )));
-            } else if let Err(error) = self.execute_remote_actor_lease(lease).await {
-                first_error.get_or_insert(error);
+            } else {
+                self.queued_tasks.fetch_sub(1, Ordering::SeqCst);
+                let _running = RunningTaskGuard::new(self.running_tasks.clone());
+                if let Err(error) = self.execute_remote_actor_lease(lease).await {
+                    first_error.get_or_insert(error);
+                }
             }
         }
 
@@ -194,7 +205,14 @@ impl Worker {
         self.register().await?;
 
         let mut poll = tokio::time::interval(self.config.poll_interval);
-        let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
+        let mut heartbeat_handle = tokio::spawn(run_heartbeat_loop(
+            self.client.clone(),
+            self.worker_id,
+            self.config.pressure_path.clone(),
+            self.config.heartbeat_interval,
+            self.running_tasks.clone(),
+            self.queued_tasks.clone(),
+        ));
         let shutdown = tokio::signal::ctrl_c();
         tokio::pin!(shutdown);
 
@@ -205,18 +223,19 @@ impl Worker {
                         break Err(error);
                     }
                 }
-                _ = heartbeat.tick() => {
-                    if let Err(error) = self.heartbeat().await {
-                        break Err(error);
-                    }
-                }
                 result = &mut shutdown => {
                     break result
                         .map_err(|error| MiniRayError::Transport(error.to_string()));
                 }
+                result = &mut heartbeat_handle => {
+                    break result
+                        .map_err(|error| MiniRayError::Transport(error.to_string()))
+                        .and_then(|result| result);
+                }
             }
         };
 
+        heartbeat_handle.abort();
         let cleanup_result = self.unregister().await;
         run_result?;
         cleanup_result
@@ -275,7 +294,9 @@ async fn execute_remote_stateless_lease(
     registry: TaskRegistry,
     mut client: HeadClient<Channel>,
     lease: TaskLease,
+    running_tasks: Arc<AtomicU32>,
 ) -> Result<()> {
+    let _running = RunningTaskGuard::new(running_tasks);
     let execution = match fetch_stateless_args_and_execute(registry, &mut client, &lease).await {
         Ok(execution) => execution,
         Err(error) => {
@@ -295,6 +316,71 @@ async fn execute_remote_stateless_lease(
         .map_err(status_error)?;
 
     Ok(())
+}
+
+async fn run_heartbeat_loop(
+    mut client: HeadClient<Channel>,
+    worker_id: WorkerId,
+    pressure_path: PathBuf,
+    heartbeat_interval: Duration,
+    running_tasks: Arc<AtomicU32>,
+    queued_tasks: Arc<AtomicU32>,
+) -> Result<()> {
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    loop {
+        heartbeat.tick().await;
+        client
+            .heartbeat(build_heartbeat_request(
+                worker_id,
+                &pressure_path,
+                &running_tasks,
+                &queued_tasks,
+            ))
+            .await
+            .map_err(status_error)?;
+    }
+}
+
+fn build_heartbeat_request(
+    worker_id: WorkerId,
+    pressure_path: &PathBuf,
+    running_tasks: &AtomicU32,
+    queued_tasks: &AtomicU32,
+) -> HeartbeatRequest {
+    let resources = sample_resources(pressure_path.clone());
+    HeartbeatRequest {
+        worker_id: worker_id.to_string(),
+        running: running_tasks.load(Ordering::SeqCst),
+        queued: queued_tasks.load(Ordering::SeqCst),
+        memory_used_bytes: resources.memory_used_bytes,
+        memory_total_bytes: resources.memory_total_bytes,
+        memory_pressure: resources.memory_pressure.as_wire(),
+        disk_used_bytes: resources.disk_used_bytes,
+        disk_total_bytes: resources.disk_total_bytes,
+        disk_pressure: resources.disk_pressure.as_wire(),
+    }
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    value.try_into().unwrap_or(u32::MAX)
+}
+
+#[derive(Debug)]
+struct RunningTaskGuard {
+    running_tasks: Arc<AtomicU32>,
+}
+
+impl RunningTaskGuard {
+    fn new(running_tasks: Arc<AtomicU32>) -> Self {
+        running_tasks.fetch_add(1, Ordering::SeqCst);
+        Self { running_tasks }
+    }
+}
+
+impl Drop for RunningTaskGuard {
+    fn drop(&mut self) {
+        self.running_tasks.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 async fn fetch_stateless_args_and_execute(
@@ -655,6 +741,27 @@ mod tests {
 
         assert_eq!(sample.total_bytes, 100 * 1024);
         assert_eq!(sample.used_bytes, 85 * 1024);
+    }
+
+    #[test]
+    fn heartbeat_request_reports_running_tasks() {
+        let running_tasks = Arc::new(AtomicU32::new(2));
+        let queued_tasks = Arc::new(AtomicU32::new(3));
+        let request = build_heartbeat_request(
+            WorkerId::new(),
+            &PathBuf::from("."),
+            &running_tasks,
+            &queued_tasks,
+        );
+
+        assert_eq!(request.running, 2);
+        assert_eq!(request.queued, 3);
+    }
+
+    #[test]
+    fn saturating_u32_caps_large_counts() {
+        assert_eq!(saturating_u32(7), 7);
+        assert_eq!(saturating_u32(usize::MAX), u32::MAX);
     }
 
     #[test]

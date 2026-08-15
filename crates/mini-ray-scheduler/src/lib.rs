@@ -75,6 +75,8 @@ impl ResourcePressure {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkerResourceUsage {
+    pub running: u32,
+    pub queued: u32,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
     pub memory_pressure: ResourcePressure,
@@ -723,6 +725,26 @@ mod tests {
                 .memory_pressure,
             ResourcePressure::High
         );
+    }
+
+    #[test]
+    fn heartbeat_records_worker_load_counts() {
+        let mut scheduler = Scheduler::default();
+        let worker = WorkerId::new();
+        scheduler.register_worker(worker, 1);
+
+        scheduler.heartbeat_with_resources(
+            worker,
+            WorkerResourceUsage {
+                running: 2,
+                queued: 3,
+                ..WorkerResourceUsage::default()
+            },
+        );
+
+        let usage = scheduler.worker_resource_usage(worker).unwrap();
+        assert_eq!(usage.running, 2);
+        assert_eq!(usage.queued, 3);
     }
 
     #[test]

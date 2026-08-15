@@ -484,6 +484,8 @@ impl Head for HeadService {
         self.scheduler.lock().await.heartbeat_with_resources(
             worker_id,
             WorkerResourceUsage {
+                running: request.running,
+                queued: request.queued,
                 memory_used_bytes: request.memory_used_bytes,
                 memory_total_bytes: request.memory_total_bytes,
                 memory_pressure: ResourcePressure::from_wire(request.memory_pressure),
