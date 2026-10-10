@@ -11,7 +11,7 @@ use mini_ray_proto::miniray::v1::{
     SubmitTaskRequest, SubmitTaskResponse, TaskLease, UnregisterWorkerRequest,
     UnregisterWorkerResponse,
 };
-use mini_ray_scheduler::{ResourcePressure, Scheduler, WorkerResourceUsage};
+use mini_ray_scheduler::{ResourcePressure, Scheduler, WorkerExpiry, WorkerResourceUsage};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -82,13 +82,14 @@ impl HeadService {
         self.actors.lock().await.len()
     }
 
-    pub async fn cleanup_expired_workers(&self) -> usize {
+    /// Returns scheduler retry/failure decisions; actor recovery may fail additional tasks.
+    pub async fn cleanup_expired_workers(&self) -> Vec<WorkerExpiry> {
         let expiries = self.scheduler.lock().await.expire_workers();
         let expired_workers: Vec<WorkerId> =
             expiries.iter().map(|expiry| expiry.worker_id).collect();
         self.recover_actors_owned_by(&expired_workers, "worker heartbeat expired")
             .await;
-        expiries.len()
+        expiries
     }
 
     pub async fn cleanup_terminal_metadata(
@@ -197,16 +198,19 @@ impl HeadService {
     }
 }
 
-pub async fn serve(bind: SocketAddr) -> Result<(), tonic::transport::Error> {
-    let service = HeadService::with_defaults();
-    let cleanup_service = service.clone();
-    let cleanup_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+fn spawn_liveness_loop(service: HeadService, interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(interval);
         loop {
             interval.tick().await;
-            cleanup_service.cleanup_expired_workers().await;
+            service.cleanup_expired_workers().await;
         }
-    });
+    })
+}
+
+pub async fn serve(bind: SocketAddr) -> Result<(), tonic::transport::Error> {
+    let service = HeadService::with_defaults();
+    let cleanup_task = spawn_liveness_loop(service.clone(), Duration::from_secs(1));
     let result = Server::builder()
         .add_service(HeadServer::new(service))
         .serve(bind)
@@ -1520,7 +1524,15 @@ mod tests {
             std::time::Instant::now() - Duration::from_secs(2),
         );
 
-        assert_eq!(service.cleanup_expired_workers().await, 1);
+        let expiries = service.cleanup_expired_workers().await;
+        assert_eq!(
+            expiries,
+            vec![WorkerExpiry {
+                worker_id: expired,
+                retried_tasks: vec![TaskId::from_string(&submitted.task_id).unwrap()],
+                failed_tasks: vec![],
+            }]
+        );
         let polled = service
             .poll_task(Request::new(PollTaskRequest {
                 worker_id: replacement.to_string(),
@@ -1533,6 +1545,309 @@ mod tests {
         assert_eq!(polled.tasks.len(), 1);
         assert_eq!(polled.tasks[0].task_id, submitted.task_id);
         assert_eq!(polled.tasks[0].attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_workers_reports_exhausted_task_and_output_failure() {
+        let service = HeadService::with_defaults();
+        let expired = WorkerId::new();
+        let replacement = WorkerId::new();
+        let output_id = ObjectId::new();
+        for worker_id in [expired, replacement] {
+            service
+                .register_worker(Request::new(RegisterWorkerRequest {
+                    worker_id: worker_id.to_string(),
+                    slots: 1,
+                }))
+                .await
+                .unwrap();
+        }
+        let submitted = service
+            .submit_task(Request::new(SubmitTaskRequest {
+                function_id: "noop".to_string(),
+                dependencies: vec![],
+                output_id: output_id.to_string(),
+                max_retries: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: expired.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap();
+        service.scheduler.lock().await.force_worker_last_heartbeat(
+            expired,
+            std::time::Instant::now() - Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            service.cleanup_expired_workers().await,
+            vec![WorkerExpiry {
+                worker_id: expired,
+                retried_tasks: vec![],
+                failed_tasks: vec![TaskId::from_string(&submitted.task_id).unwrap()],
+            }]
+        );
+        let polled = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: replacement.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(polled.tasks.is_empty());
+        let error = service
+            .get_object(Request::new(GetObjectRequest {
+                object_id: output_id.to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("worker heartbeat expired"));
+        assert!(error.message().contains(&submitted.task_id));
+        assert!(service.cleanup_expired_workers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_expiry_releases_actor_and_retries_method_on_replacement() {
+        let service = HeadService::with_defaults();
+        let actor_id = ActorId::new();
+        let owner = WorkerId::new();
+        let replacement = WorkerId::new();
+        let initial = ObjectId::new();
+        for worker_id in [owner, replacement] {
+            service
+                .register_worker(Request::new(RegisterWorkerRequest {
+                    worker_id: worker_id.to_string(),
+                    slots: 1,
+                }))
+                .await
+                .unwrap();
+        }
+        service
+            .put_object(Request::new(PutObjectRequest {
+                object_id: initial.to_string(),
+                data: encode(&10u64).unwrap(),
+            }))
+            .await
+            .unwrap();
+        service
+            .create_actor(Request::new(CreateActorRequest {
+                actor_type: "Counter".to_string(),
+                constructor_dependencies: vec![initial.to_string()],
+                actor_id: actor_id.to_string(),
+                max_restarts: 1,
+            }))
+            .await
+            .unwrap();
+        let submitted = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: ObjectId::new().to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: owner.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap();
+        service.scheduler.lock().await.force_worker_last_heartbeat(
+            owner,
+            std::time::Instant::now() - Duration::from_secs(60),
+        );
+
+        assert_eq!(service.cleanup_expired_workers().await.len(), 1);
+        assert!(matches!(
+            service.actors.lock().await.get(&actor_id).unwrap().state,
+            ActorState::Alive {
+                owner_worker: None,
+                restarts: 1,
+            }
+        ));
+        let polled = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: replacement.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(polled.tasks.len(), 1);
+        assert_eq!(polled.tasks[0].task_id, submitted.task_id);
+        assert_eq!(polled.tasks[0].actor_id, actor_id.to_string());
+        assert_eq!(
+            polled.tasks[0].constructor_dependencies,
+            vec![initial.to_string()]
+        );
+        assert_eq!(polled.tasks[0].attempt, 1);
+        assert!(matches!(
+            service.actors.lock().await.get(&actor_id).unwrap().state,
+            ActorState::Alive {
+                owner_worker: Some(worker),
+                restarts: 1,
+            } if worker == replacement
+        ));
+        assert!(service.cleanup_expired_workers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_expiry_fails_all_actor_methods_when_restarts_are_exhausted() {
+        let service = HeadService::with_defaults();
+        let actor_id = ActorId::new();
+        let owner = WorkerId::new();
+        let replacement = WorkerId::new();
+        for worker_id in [owner, replacement] {
+            service
+                .register_worker(Request::new(RegisterWorkerRequest {
+                    worker_id: worker_id.to_string(),
+                    slots: 1,
+                }))
+                .await
+                .unwrap();
+        }
+        service
+            .create_actor(Request::new(CreateActorRequest {
+                actor_type: "Counter".to_string(),
+                constructor_dependencies: vec![],
+                actor_id: actor_id.to_string(),
+                max_restarts: 0,
+            }))
+            .await
+            .unwrap();
+        let mut submitted = Vec::new();
+        for _ in 0..2 {
+            submitted.push(
+                service
+                    .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                        actor_id: actor_id.to_string(),
+                        method_id: "increment".to_string(),
+                        dependencies: vec![],
+                        output_id: ObjectId::new().to_string(),
+                        max_retries: 1,
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner(),
+            );
+        }
+        let polled = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: owner.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(polled.tasks.len(), 1);
+        service.scheduler.lock().await.force_worker_last_heartbeat(
+            owner,
+            std::time::Instant::now() - Duration::from_secs(60),
+        );
+
+        service.cleanup_expired_workers().await;
+        for task in submitted {
+            let task_id = TaskId::from_string(&task.task_id).unwrap();
+            assert!(matches!(
+                service.scheduler.lock().await.task_state(task_id),
+                Some(TaskState::Failed(_))
+            ));
+            let error = service
+                .get_object(Request::new(GetObjectRequest {
+                    object_id: task.output_id,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(error.message().contains("actor restart budget exhausted"));
+        }
+        let retry = service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: replacement.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(retry.tasks.is_empty());
+        let error = service
+            .submit_actor_task(Request::new(SubmitActorTaskRequest {
+                actor_id: actor_id.to_string(),
+                method_id: "increment".to_string(),
+                dependencies: vec![],
+                output_id: ObjectId::new().to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("worker heartbeat expired"));
+    }
+
+    #[tokio::test]
+    async fn liveness_loop_expires_workers_without_poll_requests() {
+        let service = HeadService::with_defaults();
+        let worker = WorkerId::new();
+        service
+            .register_worker(Request::new(RegisterWorkerRequest {
+                worker_id: worker.to_string(),
+                slots: 1,
+            }))
+            .await
+            .unwrap();
+        let submitted = service
+            .submit_task(Request::new(SubmitTaskRequest {
+                function_id: "noop".to_string(),
+                dependencies: vec![],
+                output_id: ObjectId::new().to_string(),
+                max_retries: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        service
+            .poll_task(Request::new(PollTaskRequest {
+                worker_id: worker.to_string(),
+                capacity: 1,
+            }))
+            .await
+            .unwrap();
+        let task_id = TaskId::from_string(&submitted.task_id).unwrap();
+        let cleanup_task = spawn_liveness_loop(service.clone(), Duration::from_millis(10));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service.scheduler.lock().await.task_state(task_id),
+            Some(TaskState::Leased(worker))
+        );
+        service.scheduler.lock().await.force_worker_last_heartbeat(
+            worker,
+            std::time::Instant::now() - Duration::from_secs(60),
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if service.scheduler.lock().await.task_state(task_id) == Some(TaskState::Ready) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        cleanup_task.abort();
+        assert!(cleanup_task.await.unwrap_err().is_cancelled());
+        result.expect("liveness loop should retry the task without polling");
+        assert!(service.cleanup_expired_workers().await.is_empty());
     }
 
     #[tokio::test]
