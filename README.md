@@ -38,6 +38,13 @@ The scheduler tracks object availability and internal task dependency references
 
 See [docs/architecture.md](docs/architecture.md) for task, actor, worker, and metadata cleanup behavior.
 
+## Proposed PyTorch Integration
+
+The Python launcher is design work; it is not implemented yet.
+
+- [Launcher design](pytorch-integration/launcher-design.md): first CPU training job, process lifecycle, and result contract.
+- [IPC design comparison](pytorch-integration/ipc-design-comparison.md): Ray worker/raylet communication, transport tradeoffs, and proposed local control protocol.
+
 ## Running Locally
 
 Start the head:
