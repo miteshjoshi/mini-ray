@@ -4,6 +4,8 @@ Status: Design comparison and proposed decisions; no IPC launcher implementation
 Reviewed: 2026-10-31.
 Related: [Python launcher design](launcher-design.md).
 
+Next: [Local IPC implementation sketch](ipc-implementation-sketch.md), with Rust supervisor and Python bootstrap interfaces.
+
 ## Decision
 
 For the first one-shot CPU training demonstration, retain the existing proposed JSON-file contract and OS exit status. It needs configuration and a final result, with stdout/stderr redirected to files.
